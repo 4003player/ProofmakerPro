@@ -1724,6 +1724,19 @@ function processRasterFile(file) {
       var uint8 = new Uint8Array(headerBuf);
       var dpi = detectDpiFromBytes(uint8, file.name) || 0;
 
+      // Detect CMYK JPEG: find SOF marker and check if num_components === 4
+      var _isCMYK = false;
+      if (!isTiff) {
+        for (var ci = 0; ci < uint8.length - 10; ci++) {
+          if (uint8[ci] === 0xFF && uint8[ci+1] >= 0xC0 && uint8[ci+1] <= 0xC3 && uint8[ci+1] !== 0xC4) {
+            if (uint8[ci+9] === 4) _isCMYK = true;
+            break;
+          }
+        }
+      }
+      // Stash on file for downstream use
+      file._isCMYK = _isCMYK;
+
       if (isTiff && typeof UTIF !== 'undefined') {
         // Try to get pixel dimensions from IFD tags (fast — no decode needed).
         // This works even when the full file is too large for UTIF to decode.
@@ -1975,7 +1988,8 @@ function showRasterModal(file, pixW, pixH, detectedDpi, imgEl) {
               trimW: trimW, trimH: trimH,
               format: ext,
               imgDataUrl: serverData.pages[0].dataUrl,
-              hasWhiteEdges: true
+              hasWhiteEdges: true,
+              isCMYK: file._isCMYK || false
             }
           });
         }).catch(function(err) {
@@ -2061,7 +2075,8 @@ function showRasterModal(file, pixW, pixH, detectedDpi, imgEl) {
           trimW: trimW, trimH: trimH,
           format: ext,
           imgDataUrl: imgDataUrl,
-          hasWhiteEdges: hasWhiteEdges
+          hasWhiteEdges: hasWhiteEdges,
+          isCMYK: file._isCMYK || false
         }
       });
       }); // end resizePromise.then
@@ -4731,7 +4746,7 @@ window.generateProof = function() {
     if (entry.type === 'raster') {
       var rm = entry.rasterMeta;
       pagePlan.push({
-        type: 'raster', filename: entry.file.name, totalPages: 1, pageNum: 1,
+        type: 'raster', file: entry.file, filename: entry.file.name, totalPages: 1, pageNum: 1,
         rasterMeta: rm, perQty: entry.perQty || '', perScale: entry.perScale || '',
         isOpwBack: entry.isOpwBack || false, whitePlateFile: entry.whitePlateFile || null,
         whitePlatePageNum: entry.whitePlatePageNum || 1,
@@ -4829,6 +4844,49 @@ window.generateProof = function() {
     // Helper: get image data for a page plan item (PDF or raster)
     function getPageImage(item) {
       if (item.type === 'raster') {
+        // Check if this raster file is a CMYK JPEG — if so, re-render via GS server
+        // (browser's native JPEG decoder botches CMYK color conversion)
+        if (item.rasterMeta && item.rasterMeta.isCMYK) {
+          return queueServerRender(item.file, 150, 95, '1').then(function(serverData) {
+            if (!serverData.pages || serverData.pages.length === 0) {
+              throw new Error('Server returned no pages for CMYK raster');
+            }
+            var serverImg = serverData.pages[0];
+            return new Promise(function(resolve) {
+              var img = new Image();
+              img.onload = function() {
+                var rm = item.rasterMeta;
+                resolve({
+                  imgDataUrl: serverImg.dataUrl,
+                  widthIn: rm.widthIn,
+                  heightIn: rm.heightIn,
+                  imgPixW: img.naturalWidth,
+                  imgPixH: img.naturalHeight,
+                  hasWhiteEdges: rm.hasWhiteEdges,
+                  totalPages: 1,
+                  trimBox: rm.bleed > 0 ? { widthIn: rm.trimW, heightIn: rm.trimH } : null,
+                  spotColors: [],
+                  rasterInfo: { dpi: rm.dpi, pixW: rm.pixW, pixH: rm.pixH, bleed: rm.bleed },
+                  _serverRendered: true
+                });
+              };
+              img.onerror = function() {
+                // Fall back to browser-rendered version
+                resolve({
+                  imgDataUrl: item.rasterMeta.imgDataUrl,
+                  widthIn: rm.widthIn,
+                  heightIn: rm.heightIn,
+                  hasWhiteEdges: rm.hasWhiteEdges,
+                  totalPages: 1,
+                  trimBox: rm.bleed > 0 ? { widthIn: rm.trimW, heightIn: rm.trimH } : null,
+                  spotColors: [],
+                  rasterInfo: { dpi: rm.dpi, pixW: rm.pixW, pixH: rm.pixH, bleed: rm.bleed }
+                });
+              };
+              img.src = serverImg.dataUrl;
+            });
+          });
+        }
         var rm = item.rasterMeta;
         var rasterResult = {
           imgDataUrl: rm.imgDataUrl,
