@@ -3617,6 +3617,18 @@ function shouldUseServer(file) {
   return file.size >= GS_THRESHOLD_MB * 1024 * 1024;
 }
 
+// Quick scan of PDF raw bytes for CMYK image XObjects.
+// PDF.js converts CMYK→RGB with a naive formula that bands smooth blends;
+// Ghostscript uses proper ICC color management. Returns true if any
+// /ColorSpace/DeviceCMYK image is found (not counting Separation CS).
+function hasCMYKImages(uint8Array) {
+  var len = Math.min(uint8Array.length, 256 * 1024); // scan first 256 KB
+  var text = new TextDecoder('latin1').decode(uint8Array.subarray(0, len));
+  // Match image XObject with DeviceCMYK colorspace
+  return /\/Subtype\s*\/Image[\s\S]{0,200}\/ColorSpace\s*\/DeviceCMYK/.test(text) ||
+         /\/ColorSpace\s*\/DeviceCMYK[\s\S]{0,200}\/Subtype\s*\/Image/.test(text);
+}
+
 function renderPdfPageToImage(file, pageNum) {
   return file.arrayBuffer().then(function(arrayBuf) {
     var rawBytes = new Uint8Array(arrayBuf);
@@ -4841,8 +4853,12 @@ window.generateProof = function() {
         }
         return Promise.resolve(rasterResult);
       } else {
-        // ── Hybrid rendering: use server for large files, browser for small ──
-        var useServer = shouldUseServer(item.file);
+        // ── Hybrid rendering: use server for large files or CMYK images ──
+        // Read first 256 KB to check for CMYK images (PDF.js bands CMYK blends)
+        var cmykCheckSlice = item.file.slice(0, 256 * 1024);
+        return cmykCheckSlice.arrayBuffer().then(function(headerBuf) {
+        var headerBytes = new Uint8Array(headerBuf);
+        var useServer = shouldUseServer(item.file) || hasCMYKImages(headerBytes);
         if (useServer) {
           return queueServerRender(item.file, 150, 95, String(item.pageNum)).then(function(serverData) {
             if (!serverData.pages || serverData.pages.length === 0) {
@@ -5045,6 +5061,7 @@ window.generateProof = function() {
           });
         });
         } // end else (browser path)
+        }); // end cmykCheckSlice.arrayBuffer
       }
     }
 
