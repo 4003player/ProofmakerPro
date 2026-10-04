@@ -4895,18 +4895,64 @@ window.generateProof = function() {
                     var dieLineBox = detectDieLineFromOpList(opList, spotColors, vp);
                     pdf.destroy();
 
-                    // Get rendered image pixel dimensions
+                    // Get rendered image pixel dimensions + crop to die/trim box
                     return new Promise(function(resolve) {
                       var img = new Image();
                       img.onload = function() {
                         var pw = img.naturalWidth, ph = img.naturalHeight;
+                        var finalDataUrl = serverImg.dataUrl;
+                        var finalW = pw, finalH = ph;
+                        var hasWhiteEdges = true;
+
+                        // Crop to die line box or TrimBox if available
+                        var cropBox = null;
+                        if (dieLineBox && dieLineBox.x1 !== undefined) {
+                          cropBox = dieLineBox;
+                        } else if (trimBox && trimBox.x1 !== undefined) {
+                          cropBox = trimBox;
+                        }
+                        if (cropBox) {
+                          // CropBox coords are in PDF points from bottom-left
+                          // Server image maps the full page (vp.width x vp.height pts)
+                          var pxPerPt = pw / vp.width;
+                          var cx = Math.round(cropBox.x1 * pxPerPt);
+                          var cy = Math.round((vp.height - cropBox.y2) * pxPerPt); // flip Y
+                          var cw = Math.round((cropBox.x2 - cropBox.x1) * pxPerPt);
+                          var ch = Math.round((cropBox.y2 - cropBox.y1) * pxPerPt);
+                          // Clamp to image bounds
+                          cx = Math.max(0, cx); cy = Math.max(0, cy);
+                          cw = Math.min(cw, pw - cx);
+                          ch = Math.min(ch, ph - cy);
+                          if (cw > 50 && ch > 50) {
+                            var cropCanvas = document.createElement('canvas');
+                            cropCanvas.width = cw; cropCanvas.height = ch;
+                            cropCanvas.getContext('2d').drawImage(img, cx, cy, cw, ch, 0, 0, cw, ch);
+                            finalDataUrl = cropCanvas.toDataURL('image/jpeg', 0.85);
+                            finalW = cw; finalH = ch;
+                            // Re-check white edges on cropped image
+                            var cImgData = cropCanvas.getContext('2d').getImageData(0, 0, cw, ch);
+                            var cdd = cImgData.data;
+                            var ced = Math.min(5, Math.floor(cw/4), Math.floor(ch/4));
+                            var rS=0, gS=0, bS=0, cnt=0;
+                            for (var yy = 0; yy < ch; yy++) {
+                              for (var xx = 0; xx < cw; xx++) {
+                                if (yy < ced || yy >= ch-ced || xx < ced || xx >= cw-ced) {
+                                  var idx = (yy * cw + xx) * 4;
+                                  rS += cdd[idx]; gS += cdd[idx+1]; bS += cdd[idx+2]; cnt++;
+                                }
+                              }
+                            }
+                            hasWhiteEdges = (rS/cnt > 240 && gS/cnt > 240 && bS/cnt > 240);
+                          }
+                        }
+
                         resolve({
-                          imgDataUrl: serverImg.dataUrl,
+                          imgDataUrl: finalDataUrl,
                           widthIn: widthIn,
                           heightIn: heightIn,
-                          imgPixW: pw,
-                          imgPixH: ph,
-                          hasWhiteEdges: true,
+                          imgPixW: finalW,
+                          imgPixH: finalH,
+                          hasWhiteEdges: hasWhiteEdges,
                           totalPages: serverData.pages.length,
                           trimBox: trimBox,
                           spotColors: spotColors,
