@@ -4866,47 +4866,71 @@ window.generateProof = function() {
               var rawBytes = new Uint8Array(buf);
               var allTrimBoxes = findTrimBox(rawBytes);
               var spotColors = findSpotColors(rawBytes);
-              var vp72w = 0, vp72h = 0;
-              // Estimate page dimensions from first TrimBox or PDF MediaBox
-              if (allTrimBoxes.length > 0) {
-                vp72w = allTrimBoxes[0].widthIn;
-                vp72h = allTrimBoxes[0].heightIn;
-              }
-              // Create an <img> to get actual pixel dimensions
-              return new Promise(function(resolve) {
-                var img = new Image();
-                img.onload = function() {
-                  var pw = img.naturalWidth, ph = img.naturalHeight;
-                  // If we don't have page dims from TrimBox, estimate from rendered pixels at 150 DPI
-                  if (!vp72w) { vp72w = pw / 150; vp72h = ph / 150; }
-                  var trimBox = allTrimBoxes.length > 0 ? allTrimBoxes[0] : null;
-                  resolve({
-                    imgDataUrl: serverImg.dataUrl,
-                    widthIn: vp72w,
-                    heightIn: vp72h,
-                    imgPixW: pw,
-                    imgPixH: ph,
-                    hasWhiteEdges: true,
-                    totalPages: serverData.pages.length,
-                    trimBox: trimBox,
-                    spotColors: spotColors,
-                    dieLineBox: null,
-                    _serverRendered: true
+
+              // Open with PDF.js for page dimensions + die line detection
+              var bufCopy = buf.slice ? buf.slice(0) : new Uint8Array(buf).buffer;
+              return pdfjsLib.getDocument({ data: bufCopy }).promise.then(function(pdf) {
+                return pdf.getPage(item.pageNum || 1).then(function(page) {
+                  var vp = page.getViewport({ scale: 1.0 });
+                  var widthIn = vp.width / 72;
+                  var heightIn = vp.height / 72;
+
+                  // Pick best TrimBox for this page
+                  var trimBox = null;
+                  if (allTrimBoxes.length === 1) {
+                    var tb = allTrimBoxes[0];
+                    if (tb.widthIn <= widthIn + 0.1 && tb.heightIn <= heightIn + 0.1) trimBox = tb;
+                  } else if (allTrimBoxes.length > 1) {
+                    var bestDiff = Infinity;
+                    allTrimBoxes.forEach(function(tb) {
+                      if (tb.widthIn <= widthIn + 0.1 && tb.heightIn <= heightIn + 0.1) {
+                        var diff = Math.abs(tb.widthIn - widthIn) + Math.abs(tb.heightIn - heightIn);
+                        if (diff < bestDiff) { bestDiff = diff; trimBox = tb; }
+                      }
+                    });
+                  }
+
+                  // Die line detection via operator list
+                  return page.getOperatorList().then(function(opList) {
+                    var dieLineBox = detectDieLineFromOpList(opList, spotColors, vp);
+                    pdf.destroy();
+
+                    // Get rendered image pixel dimensions
+                    return new Promise(function(resolve) {
+                      var img = new Image();
+                      img.onload = function() {
+                        var pw = img.naturalWidth, ph = img.naturalHeight;
+                        resolve({
+                          imgDataUrl: serverImg.dataUrl,
+                          widthIn: widthIn,
+                          heightIn: heightIn,
+                          imgPixW: pw,
+                          imgPixH: ph,
+                          hasWhiteEdges: true,
+                          totalPages: serverData.pages.length,
+                          trimBox: trimBox,
+                          spotColors: spotColors,
+                          dieLineBox: dieLineBox,
+                          _serverRendered: true
+                        });
+                      };
+                      img.onerror = function() {
+                        resolve({
+                          imgDataUrl: serverImg.dataUrl,
+                          widthIn: widthIn,
+                          heightIn: heightIn,
+                          hasWhiteEdges: true,
+                          totalPages: serverData.pages.length,
+                          trimBox: trimBox,
+                          spotColors: spotColors,
+                          dieLineBox: dieLineBox,
+                          _serverRendered: true
+                        });
+                      };
+                      img.src = serverImg.dataUrl;
+                    });
                   });
-                };
-                img.onerror = function() {
-                  resolve({
-                    imgDataUrl: serverImg.dataUrl,
-                    widthIn: vp72w || 11,
-                    heightIn: vp72h || 8.5,
-                    hasWhiteEdges: true,
-                    totalPages: serverData.pages.length,
-                    trimBox: null,
-                    spotColors: spotColors,
-                    _serverRendered: true
-                  });
-                };
-                img.src = serverImg.dataUrl;
+                });
               });
             });
           }).then(function(result) {
