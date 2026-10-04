@@ -1725,10 +1725,14 @@ function processRasterFile(file) {
       var dpi = detectDpiFromBytes(uint8, file.name) || 0;
 
       // Detect CMYK JPEG: find SOF marker and check if num_components === 4
+      // Also extract pixel dimensions from SOF for pixel-count threshold
       var _isCMYK = false;
+      var _sofW = 0, _sofH = 0;
       if (!isTiff) {
         for (var ci = 0; ci < uint8.length - 10; ci++) {
           if (uint8[ci] === 0xFF && uint8[ci+1] >= 0xC0 && uint8[ci+1] <= 0xC3 && uint8[ci+1] !== 0xC4) {
+            _sofH = (uint8[ci+5] << 8) | uint8[ci+6];
+            _sofW = (uint8[ci+7] << 8) | uint8[ci+8];
             if (uint8[ci+9] === 4) _isCMYK = true;
             break;
           }
@@ -1837,12 +1841,23 @@ function processRasterFile(file) {
         });
       } else {
         // JPG/PNG: for huge files, get dimensions from header and use server rendering
-        // instead of trying to decode 352MP in the browser
-        var isHugeRaster = shouldUseServer(file) || file.size > 20 * 1024 * 1024;
+        // instead of trying to decode 352MP in the browser.
+        // Also check pixel count from SOF — a 190MP image at 17 MB compressed
+        // will crash the browser canvas even though file size is modest.
+        var _sofPixels = _sofW * _sofH;
+        var isHugeRaster = shouldUseServer(file) || file.size > 20 * 1024 * 1024 || _sofPixels > 80000000;
 
         if (isHugeRaster) {
-          // Get pixel dimensions without full decode — create Image just for dimensions
-          // but don't wait for full decode on enormous files
+          // For huge rasters, use SOF dimensions if available (already parsed above)
+          // and pass imgEl=null to force server rendering — never try to decode
+          // 100+ megapixel images on the browser canvas.
+          if (_sofW > 0 && _sofH > 0) {
+            showRasterModal(file, _sofW, _sofH, dpi, null).then(function(result) {
+              resolve(result);
+            }).catch(function() { resolve(null); });
+            return;
+          }
+          // Fallback: get pixel dimensions from Image object (just for dims, not drawing)
           var dimUrl = URL.createObjectURL(file);
           var dimImg = new Image();
           var dimTimeout = setTimeout(function() {
@@ -1874,7 +1889,8 @@ function processRasterFile(file) {
             var pixW = dimImg.naturalWidth;
             var pixH = dimImg.naturalHeight;
             URL.revokeObjectURL(dimUrl);
-            showRasterModal(file, pixW, pixH, dpi, dimImg).then(function(result) {
+            // Pass null for imgEl to force server rendering for huge images
+            showRasterModal(file, pixW, pixH, dpi, null).then(function(result) {
               resolve(result);
             }).catch(function() { resolve(null); });
           };
@@ -2060,7 +2076,9 @@ function showRasterModal(file, pixW, pixH, detectedDpi, imgEl) {
       }
       var hasWhiteEdges = (rS/cnt > 240 && gS/cnt > 240 && bS/cnt > 240);
 
-      applyCMYKSimulation(canvas);
+      // Only apply CMYK gamut simulation to actual CMYK images —
+      // RGB rasters should keep their original colors untouched
+      if (file._isCMYK) applyCMYKSimulation(canvas);
       var imgDataUrl = canvas.toDataURL('image/jpeg', 0.85);
 
       cleanup();
@@ -4885,6 +4903,21 @@ window.generateProof = function() {
               };
               img.src = serverImg.dataUrl;
             });
+          }).catch(function(serverErr) {
+            // Server render failed — fall back to browser-decoded image
+            // (colors may be off for CMYK, but at least the proof won't be blank)
+            console.warn('CMYK server render failed, using browser fallback:', serverErr);
+            var rm = item.rasterMeta;
+            return {
+              imgDataUrl: rm.imgDataUrl,
+              widthIn: rm.widthIn,
+              heightIn: rm.heightIn,
+              hasWhiteEdges: rm.hasWhiteEdges,
+              totalPages: 1,
+              trimBox: rm.bleed > 0 ? { widthIn: rm.trimW, heightIn: rm.trimH } : null,
+              spotColors: [],
+              rasterInfo: { dpi: rm.dpi, pixW: rm.pixW, pixH: rm.pixH, bleed: rm.bleed }
+            };
           });
         }
         var rm = item.rasterMeta;
