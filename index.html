@@ -4853,13 +4853,9 @@ window.generateProof = function() {
         }
         return Promise.resolve(rasterResult);
       } else {
-        // ── Hybrid rendering: use server for large files or CMYK images ──
-        // Read first 256 KB to check for CMYK images (PDF.js bands CMYK blends)
-        var cmykCheckSlice = item.file.slice(0, 256 * 1024);
-        return cmykCheckSlice.arrayBuffer().then(function(headerBuf) {
-        var headerBytes = new Uint8Array(headerBuf);
-        var useServer = shouldUseServer(item.file) || hasCMYKImages(headerBytes);
-        if (useServer) {
+        // ── Always use GS server for PDFs — proper color management ──
+        // and consistent rendering of blends, gradients, and complex artwork
+        {
           return queueServerRender(item.file, 150, 95, String(item.pageNum)).then(function(serverData) {
             if (!serverData.pages || serverData.pages.length === 0) {
               throw new Error('Server returned no pages');
@@ -4986,82 +4982,8 @@ window.generateProof = function() {
             return result;
           });
           });
-        } else {
-        // ── Browser rendering for smaller files ──
-        return renderPdfPageToImage(item.file, item.pageNum).then(function(result) {
-          var classifyPromise;
-          // If white plate file is already attached (via + WP all pages), auto-classify
-          // white spots without showing the file picker for them
-          if (item.whitePlateFile && result.spotColors) {
-            result.spotColors.forEach(function(sc) {
-              if (sc.needsClassification) {
-                var rawLower = sc.rawName.replace(/[\s_-]/g, '').toLowerCase();
-                if (/^(opw\d*|white|spotwhite|whiteink|opaquewhite)$/.test(rawLower)) {
-                  sc.type = 'white';
-                  sc.needsClassification = false;
-                  _spotClassificationCache[sc.key] = { type: 'white' };
-                }
-              }
-            });
-          }
-          if (result.spotColors && result.spotColors.some(function(sc) { return sc.needsClassification; })) {
-            progressOverlay.classList.remove('active');
-            classifyPromise = showSpotColorClassification(result.spotColors).then(function(classified) {
-              cancelDelayedSpin(); progressOverlay.classList.add('active');
-              result.spotColors = classified;
-            });
-          } else {
-            classifyPromise = Promise.resolve();
-          }
-
-          return classifyPromise.then(function() {
-            if (item.whitePlateFile) {
-              return loadWhitePlateFile(item.whitePlateFile, item.whitePlatePageNum).then(function(thumb) {
-                if (thumb) {
-                  if (!thumb.spotName) thumb.spotName = item.whitePlateFile.name;
-                  if (result.spotColors) {
-                    result.spotColors.forEach(function(sc) {
-                      if (sc.type === 'white') thumb.spotName = sc.rawName;
-                    });
-                  }
-                  result.whitePlateThumb = thumb;
-                }
-                delete result._rawBytes;
-                return result;
-              });
-            }
-
-            var whiteSpotKey = null;
-            if (result.spotColors) {
-              result.spotColors.forEach(function(sc) {
-                if (sc.type === 'white') whiteSpotKey = sc.key;
-              });
-            }
-            var cached = whiteSpotKey ? _spotClassificationCache[whiteSpotKey] : null;
-            var hasUserWpFile = cached && cached.wpFiles && cached.wpFileIndex < cached.wpFiles.length;
-
-            if (hasUserWpFile) {
-              var wpFile = cached.wpFiles[cached.wpFileIndex];
-              cached.wpFileIndex++;
-              return loadWhitePlateFile(wpFile).then(function(thumb) {
-                if (thumb) {
-                  thumb.spotName = whiteSpotKey || 'OPW';
-                  result.spotColors.forEach(function(sc) {
-                    if (sc.type === 'white') thumb.spotName = sc.rawName;
-                  });
-                  result.whitePlateThumb = thumb;
-                }
-                delete result._rawBytes;
-                return result;
-              });
-            }
-
-            delete result._rawBytes;
-            return result;
-          });
         });
-        } // end else (browser path)
-        }); // end cmykCheckSlice.arrayBuffer
+        } // end server rendering
       }
     }
 
