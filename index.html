@@ -4,7 +4,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Proof Sheet Generator</title>
+<title>Proofmaker Pro</title>
 
 <!-- PDF.js (legacy build - works without ES modules) -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
@@ -143,6 +143,36 @@ header p { color: #86868b; font-size: 14px; margin-top: 6px; }
 }
 .progress-overlay .status { margin-top: 12px; font-size: 15px; font-weight: 500; }
 .progress-overlay .detail { font-size: 12px; color: #86868b; margin-top: 4px; }
+
+
+/* ── Server render spinner ── */
+.server-spinner {
+  display: none; position: fixed; inset: 0; background: rgba(255,255,255,0.95);
+  z-index: 10000; justify-content: center; align-items: center; flex-direction: column;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  pointer-events: none;
+}
+.server-spinner.active { display: flex; pointer-events: auto; }
+.server-spinner .spin-ring {
+  width: 48px; height: 48px; border: 4px solid #e8e8ed;
+  border-top-color: #0071e3; border-radius: 50%;
+  animation: spin-ring 0.9s linear infinite;
+}
+@keyframes spin-ring { to { transform: rotate(360deg); } }
+.server-spinner .spin-status {
+  margin-top: 16px; font-size: 15px; font-weight: 500; color: #1d1d1f;
+}
+.server-spinner .spin-detail {
+  font-size: 12px; color: #86868b; margin-top: 4px;
+}
+.server-spinner .spin-progress {
+  width: 240px; height: 6px; background: #e8e8ed; border-radius: 3px;
+  overflow: hidden; margin-top: 12px;
+}
+.server-spinner .spin-fill {
+  height: 100%; background: #0071e3; border-radius: 3px; width: 0%;
+  transition: width 0.4s;
+}
 
 /* Result */
 .result-section { display: none; }
@@ -519,10 +549,18 @@ header p { color: #86868b; font-size: 14px; margin-top: 6px; }
   <div class="detail" id="progress-detail">Preparing…</div>
 </div>
 
+<!-- Server render spinner -->
+<div class="server-spinner" id="server-spinner">
+  <div class="spin-ring"></div>
+  <div class="spin-status" id="spin-status">Processing files…</div>
+  <div class="spin-progress"><div class="spin-fill" id="spin-fill"></div></div>
+  <div class="spin-detail" id="spin-detail"></div>
+</div>
+
 <!-- Main form -->
 <div class="container" id="form-section">
   <header>
-    <h1>📋 Proof Sheet Generator</h1>
+    <h1>📋 Proofmaker Pro</h1>
     <p>Drop your print-ready PDFs or images and fill in the job details</p>
   </header>
 
@@ -896,6 +934,10 @@ function processNextRasterInGroup(group, gid) {
       group.files.push(entry);
       renderGroupFileList(group, gid);
     }
+    group.processingRaster = false;
+    processNextRasterInGroup(group, gid);
+  }).catch(function(err) {
+    console.error('Raster processing failed:', f.name, err);
     group.processingRaster = false;
     processNextRasterInGroup(group, gid);
   });
@@ -1335,6 +1377,7 @@ function showOpwBackModal(group, gid) {
 
   contBtn.addEventListener('click', function() {
     modal.classList.remove('active');
+    startDelayedSpin();
     if (!_opwBackFile || !_opwBackGroup) return;
     var backFile = _opwBackFile;
     var group = _opwBackGroup;
@@ -1781,8 +1824,59 @@ function processRasterFile(file) {
           }
         });
       } else {
-        // JPG/PNG: use native Image element from blob URL — the browser's
-        // decoder handles large files efficiently without buffering everything.
+        // JPG/PNG: for huge files, get dimensions from header and use server rendering
+        // instead of trying to decode 352MP in the browser
+        var isHugeRaster = shouldUseServer(file) || file.size > 20 * 1024 * 1024;
+
+        if (isHugeRaster) {
+          // Get pixel dimensions without full decode — create Image just for dimensions
+          // but don't wait for full decode on enormous files
+          var dimUrl = URL.createObjectURL(file);
+          var dimImg = new Image();
+          var dimTimeout = setTimeout(function() {
+            // If image hasn't loaded in 5s, try to get dims from header bytes
+            URL.revokeObjectURL(dimUrl);
+            var estPixW = 0, estPixH = 0;
+            // Parse JPEG SOF marker for dimensions
+            try {
+              for (var si = 0; si < uint8.length - 10; si++) {
+                if (uint8[si] === 0xFF && (uint8[si+1] >= 0xC0 && uint8[si+1] <= 0xC3) && uint8[si+1] !== 0xC4) {
+                  estPixH = (uint8[si+5] << 8) | uint8[si+6];
+                  estPixW = (uint8[si+7] << 8) | uint8[si+8];
+                  if (estPixW > 0 && estPixH > 0) break;
+                }
+              }
+            } catch(e) {}
+            if (estPixW > 0) {
+              showRasterModal(file, estPixW, estPixH, dpi, null).then(function(result) {
+                resolve(result);
+              }).catch(function() { resolve(null); });
+            } else {
+              alert('Could not determine dimensions for: ' + file.name);
+              resolve(null);
+            }
+          }, 5000);
+
+          dimImg.onload = function() {
+            clearTimeout(dimTimeout);
+            var pixW = dimImg.naturalWidth;
+            var pixH = dimImg.naturalHeight;
+            URL.revokeObjectURL(dimUrl);
+            showRasterModal(file, pixW, pixH, dpi, dimImg).then(function(result) {
+              resolve(result);
+            }).catch(function() { resolve(null); });
+          };
+          dimImg.onerror = function() {
+            clearTimeout(dimTimeout);
+            URL.revokeObjectURL(dimUrl);
+            alert('Could not read image: ' + file.name);
+            resolve(null);
+          };
+          dimImg.src = dimUrl;
+          return;
+        }
+
+        // Normal-sized JPG/PNG: decode in browser
         var url = URL.createObjectURL(file);
         var img = new Image();
         img.onload = function() {
@@ -1864,16 +1958,37 @@ function showRasterModal(file, pixW, pixH, detectedDpi, imgEl) {
       if (trimW < 0) trimW = fullW;
       if (trimH < 0) trimH = fullH;
 
-      // Create the data URL (downsample if huge)
-      var canvas = document.createElement('canvas');
-      var maxPx = 2400;
-      var cw = pixW, ch = pixH;
-      if (Math.max(cw, ch) > maxPx) {
-        var ratio = maxPx / Math.max(cw, ch);
-        cw = Math.floor(cw * ratio);
-        ch = Math.floor(ch * ratio);
+      // ── If imgEl is null (huge file), use server rendering ──
+      if (!imgEl) {
+        cleanup();
+        queueServerRender(file, 150, 95, 'all').then(function(serverData) {
+          if (!serverData.pages || serverData.pages.length === 0) {
+            resolve(null); return;
+          }
+          resolve({
+            file: file,
+            type: 'raster',
+            rasterMeta: {
+              dpi: d,
+              pixW: pixW, pixH: pixH,
+              widthIn: fullW, heightIn: fullH,
+              bleed: bleed,
+              trimW: trimW, trimH: trimH,
+              format: ext,
+              imgDataUrl: serverData.pages[0].dataUrl,
+              hasWhiteEdges: true
+            }
+          });
+        }).catch(function(err) {
+          console.error('Server render failed:', err);
+          alert('Server render failed for ' + file.name + ': ' + err.message);
+          resolve(null);
+        });
+        return;
       }
-      canvas.width = cw; canvas.height = ch;
+
+      // Create the data URL (downsample if huge, using createImageBitmap for quality)
+      var maxPx = 1800;
 
       // If there's bleed, crop to trim area
       var srcX = 0, srcY = 0, srcW = pixW, srcH = pixH;
@@ -1883,21 +1998,42 @@ function showRasterModal(file, pixW, pixH, detectedDpi, imgEl) {
         srcW = pixW - bleedPx * 2;
         srcH = pixH - bleedPx * 2;
         if (srcW < 1 || srcH < 1) { srcX = 0; srcY = 0; srcW = pixW; srcH = pixH; }
-        // Recalculate canvas size for trimmed image
-        var tw = srcW, th = srcH;
-        if (Math.max(tw, th) > maxPx) {
-          var r2 = maxPx / Math.max(tw, th);
-          tw = Math.floor(tw * r2);
-          th = Math.floor(th * r2);
-        }
-        canvas.width = tw; canvas.height = th;
-        cw = tw; ch = th;
       }
 
-      canvas.getContext('2d').drawImage(imgEl, srcX, srcY, srcW, srcH, 0, 0, cw, ch);
+      // Determine target size
+      var cw = srcW, ch = srcH;
+      var needsResize = Math.max(cw, ch) > maxPx;
+      if (needsResize) {
+        var ratio = maxPx / Math.max(cw, ch);
+        cw = Math.floor(cw * ratio);
+        ch = Math.floor(ch * ratio);
+      }
+
+      // High-quality downsample via createImageBitmap — crop + resize directly
+      // from imgEl, never creating a full-res canvas (which would blow up on 352MP images)
+      var bmpOpts = { resizeWidth: cw, resizeHeight: ch, resizeQuality: 'high' };
+      var resizePromise;
+      try {
+        resizePromise = (srcX > 0 || srcY > 0 || srcW !== pixW || srcH !== pixH)
+          ? createImageBitmap(imgEl, srcX, srcY, srcW, srcH, bmpOpts)
+          : (needsResize ? createImageBitmap(imgEl, bmpOpts) : Promise.resolve(null));
+      } catch(bmpErr) {
+        console.warn('createImageBitmap failed, falling back to drawImage:', bmpErr);
+        resizePromise = Promise.resolve(null);
+      }
+
+      resizePromise.catch(function(bmpErr) {
+        console.warn('createImageBitmap async fail, falling back:', bmpErr);
+        return null;
+      }).then(function(bmp) {
+      var canvas = document.createElement('canvas');
+      canvas.width = cw; canvas.height = ch;
+      var rCtx = canvas.getContext('2d');
+      if (bmp) { rCtx.drawImage(bmp, 0, 0); bmp.close(); }
+      else { rCtx.drawImage(imgEl, 0, 0, cw, ch); }
 
       // White edge detection on final canvas
-      var iData = canvas.getContext('2d').getImageData(0, 0, cw, ch);
+      var iData = rCtx.getImageData(0, 0, cw, ch);
       var dd = iData.data;
       var ed = Math.min(5, Math.floor(cw/4), Math.floor(ch/4));
       var rS=0, gS=0, bS=0, cnt=0;
@@ -1912,7 +2048,7 @@ function showRasterModal(file, pixW, pixH, detectedDpi, imgEl) {
       var hasWhiteEdges = (rS/cnt > 240 && gS/cnt > 240 && bS/cnt > 240);
 
       applyCMYKSimulation(canvas);
-      var imgDataUrl = canvas.toDataURL('image/jpeg', 0.82);
+      var imgDataUrl = canvas.toDataURL('image/jpeg', 0.85);
 
       cleanup();
       resolve({
@@ -1929,6 +2065,7 @@ function showRasterModal(file, pixW, pixH, detectedDpi, imgEl) {
           hasWhiteEdges: hasWhiteEdges
         }
       });
+      }); // end resizePromise.then
     };
   });
 }
@@ -2494,6 +2631,7 @@ function showSpotColorClassification(spotColors) {
 
     document.getElementById('spot-ok').onclick = function() {
       modal.classList.remove('active');
+      startDelayedSpin();
 
       // Collect white plate files from file inputs
       var wpFileInputs = list.querySelectorAll('input[type="file"][data-spot-key]');
@@ -2651,28 +2789,37 @@ function loadWhitePlateFile(file, pageNum) {
         UTIF.decodeImage(buf, ifds[0]);
         var rgba = UTIF.toRGBA8(ifds[0]);
         var pw = ifds[0].width, ph = ifds[0].height;
-        var canvas = document.createElement('canvas');
         var maxPx = 600;
-        var ratio = Math.min(1, maxPx / Math.max(pw, ph));
-        canvas.width = Math.round(pw * ratio);
-        canvas.height = Math.round(ph * ratio);
+        var wpRatio = Math.min(1, maxPx / Math.max(pw, ph));
+        var tw = Math.round(pw * wpRatio);
+        var th = Math.round(ph * wpRatio);
         var tmp = document.createElement('canvas');
         tmp.width = pw; tmp.height = ph;
         var tctx = tmp.getContext('2d');
         var id = tctx.createImageData(pw, ph);
         id.data.set(new Uint8Array(rgba));
         tctx.putImageData(id, 0, 0);
-        var ctx = canvas.getContext('2d');
-        ctx.drawImage(tmp, 0, 0, canvas.width, canvas.height);
-        // Convert to grayscale
-        var imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        var d = imgData.data;
-        for (var i = 0; i < d.length; i += 4) {
-          var gray = Math.round(d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114);
-          d[i] = gray; d[i+1] = gray; d[i+2] = gray;
-        }
-        ctx.putImageData(imgData, 0, 0);
-        return { dataUrl: canvas.toDataURL('image/jpeg', 0.85), width: canvas.width, height: canvas.height };
+        // High-quality downsample via createImageBitmap
+        var wpNeedsResize = wpRatio < 1;
+        var wpResizeP = wpNeedsResize
+          ? createImageBitmap(tmp, { resizeWidth: tw, resizeHeight: th, resizeQuality: 'high' })
+          : Promise.resolve(null);
+        return wpResizeP.then(function(bmp) {
+          var canvas = document.createElement('canvas');
+          canvas.width = tw; canvas.height = th;
+          var ctx = canvas.getContext('2d');
+          if (bmp) { ctx.drawImage(bmp, 0, 0); bmp.close(); }
+          else { ctx.drawImage(tmp, 0, 0, tw, th); }
+          // Convert to grayscale
+          var imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          var d = imgData.data;
+          for (var i = 0; i < d.length; i += 4) {
+            var gray = Math.round(d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114);
+            d[i] = gray; d[i+1] = gray; d[i+2] = gray;
+          }
+          ctx.putImageData(imgData, 0, 0);
+          return { dataUrl: canvas.toDataURL('image/jpeg', 0.85), width: canvas.width, height: canvas.height };
+        });
       } catch(e) { console.warn('WP TIFF load failed:', e); return null; }
     });
   }
@@ -2682,23 +2829,32 @@ function loadWhitePlateFile(file, pageNum) {
     var url = URL.createObjectURL(file);
     var img = new Image();
     img.onload = function() {
-      var canvas = document.createElement('canvas');
       var maxPx = 600;
-      var ratio = Math.min(1, maxPx / Math.max(img.naturalWidth, img.naturalHeight));
-      canvas.width = Math.round(img.naturalWidth * ratio);
-      canvas.height = Math.round(img.naturalHeight * ratio);
-      var ctx = canvas.getContext('2d');
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      var wpRatio2 = Math.min(1, maxPx / Math.max(img.naturalWidth, img.naturalHeight));
+      var tw2 = Math.round(img.naturalWidth * wpRatio2);
+      var th2 = Math.round(img.naturalHeight * wpRatio2);
       URL.revokeObjectURL(url);
-      // Convert to grayscale
-      var imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      var d = imgData.data;
-      for (var i = 0; i < d.length; i += 4) {
-        var gray = Math.round(d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114);
-        d[i] = gray; d[i+1] = gray; d[i+2] = gray;
-      }
-      ctx.putImageData(imgData, 0, 0);
-      resolve({ dataUrl: canvas.toDataURL('image/jpeg', 0.85), width: canvas.width, height: canvas.height });
+      // High-quality downsample via createImageBitmap
+      var wpNeedsResize2 = wpRatio2 < 1;
+      var wpResizeP2 = wpNeedsResize2
+        ? createImageBitmap(img, { resizeWidth: tw2, resizeHeight: th2, resizeQuality: 'high' })
+        : Promise.resolve(null);
+      wpResizeP2.then(function(bmp) {
+        var canvas = document.createElement('canvas');
+        canvas.width = tw2; canvas.height = th2;
+        var ctx = canvas.getContext('2d');
+        if (bmp) { ctx.drawImage(bmp, 0, 0); bmp.close(); }
+        else { ctx.drawImage(img, 0, 0, tw2, th2); }
+        // Convert to grayscale
+        var imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        var d = imgData.data;
+        for (var i = 0; i < d.length; i += 4) {
+          var gray = Math.round(d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114);
+          d[i] = gray; d[i+1] = gray; d[i+2] = gray;
+        }
+        ctx.putImageData(imgData, 0, 0);
+        resolve({ dataUrl: canvas.toDataURL('image/jpeg', 0.85), width: canvas.width, height: canvas.height });
+      });
     };
     img.onerror = function() { URL.revokeObjectURL(url); resolve(null); };
     img.src = url;
@@ -3299,6 +3455,168 @@ function applyCMYKSimulation(canvas) {
   ctx.putImageData(imgData, 0, 0);
 }
 
+// ── Server-side rendering via GS Thumbnail Server ──
+// Copyright Scott Jehlik, DBA Mad Rtist Graphics
+var GS_SERVER_URL = 'https://gs-thumbnail-server.fly.dev';
+var GS_THRESHOLD_MB = 50; // Files >= this size use the server
+
+// Spinner helpers
+var _spinnerEl = null, _spinStatus = null, _spinDetail = null, _spinFill = null;
+function showSpinner(msg, detail) {
+  // Cancel any pending delayed spin since a real spinner is taking over
+  if (_delayedSpinTimer) {
+    clearTimeout(_delayedSpinTimer);
+    _delayedSpinTimer = null;
+  }
+  _delayedSpinActive = false;
+  if (!_spinnerEl) {
+    _spinnerEl = document.getElementById('server-spinner');
+    _spinStatus = document.getElementById('spin-status');
+    _spinDetail = document.getElementById('spin-detail');
+    _spinFill = document.getElementById('spin-fill');
+  }
+  _spinStatus.textContent = msg || 'Processing…';
+  _spinDetail.textContent = detail || '';
+  _spinFill.style.width = '0%';
+  _spinnerEl.classList.add('active');
+}
+function updateSpinner(msg, detail, pct) {
+  if (_spinStatus && msg) _spinStatus.textContent = msg;
+  if (_spinDetail) _spinDetail.textContent = detail || '';
+  if (_spinFill && pct !== undefined) _spinFill.style.width = pct + '%';
+}
+function hideSpinner() {
+  if (_spinnerEl) _spinnerEl.classList.remove('active');
+}
+
+// ── Delayed spinner: shows spinning wheel if processing takes > 3s after Continue/Bypass ──
+var _delayedSpinTimer = null;
+var _delayedSpinActive = false;
+function startDelayedSpin() {
+  cancelDelayedSpin();
+  _delayedSpinTimer = setTimeout(function() {
+    _delayedSpinActive = true;
+    showSpinner('Processing…', 'This may take a moment');
+  }, 3000);
+}
+function cancelDelayedSpin() {
+  if (_delayedSpinTimer) {
+    clearTimeout(_delayedSpinTimer);
+    _delayedSpinTimer = null;
+  }
+  if (_delayedSpinActive) {
+    hideSpinner();
+    _delayedSpinActive = false;
+  }
+}
+
+// Send a file to the GS server and return a data URL
+function renderViaServer(file, dpi, quality, pages) {
+  dpi = dpi || 150;
+  quality = quality || 95;
+  pages = pages || 'all';
+
+  var sizeMB = (file.size / 1024 / 1024).toFixed(1);
+  showSpinner('Sending to render server…', file.name + ' (' + sizeMB + ' MB)');
+
+  return new Promise(function(resolve, reject) {
+    var url = GS_SERVER_URL + '/render?dpi=' + dpi + '&quality=' + quality + '&pages=' + pages;
+    var formData = new FormData();
+    formData.append('file', file);
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', url);
+
+    xhr.upload.onprogress = function(e) {
+      if (e.lengthComputable) {
+        var pct = Math.round(e.loaded / e.total * 100);
+        if (pct < 100) {
+          updateSpinner('Uploading…', file.name + ' — ' + pct + '%', pct);
+        } else {
+          updateSpinner('Rendering with Ghostscript…', file.name, 100);
+        }
+      }
+    };
+
+    xhr.onload = function() {
+      if (xhr.status !== 200) {
+        hideSpinner();
+        try {
+          var errData = JSON.parse(xhr.responseText);
+          reject(new Error(errData.error + ': ' + (errData.detail || '')));
+        } catch(e) {
+          reject(new Error('Server error ' + xhr.status));
+        }
+        return;
+      }
+      try {
+        var data = JSON.parse(xhr.responseText);
+        hideSpinner();
+        resolve(data);
+      } catch(e) {
+        hideSpinner();
+        reject(new Error('Invalid server response'));
+      }
+    };
+
+    xhr.onerror = function() {
+      hideSpinner();
+      reject(new Error('Network error — is the render server reachable?'));
+    };
+
+    xhr.ontimeout = function() {
+      hideSpinner();
+      reject(new Error('Server request timed out'));
+    };
+
+    xhr.timeout = 300000; // 5 minutes
+    xhr.send(formData);
+  });
+}
+
+// Batch queue: process files sequentially to avoid overloading the server
+// Each item: { file, dpi, quality, pages, callback }
+var _serverQueue = [];
+var _serverQueueRunning = false;
+var _serverQueueTotal = 0;
+var _serverQueueDone = 0;
+
+function queueServerRender(file, dpi, quality, pages) {
+  return new Promise(function(resolve, reject) {
+    _serverQueue.push({ file: file, dpi: dpi, quality: quality, pages: pages, resolve: resolve, reject: reject });
+    _serverQueueTotal = _serverQueue.length + _serverQueueDone;
+    if (!_serverQueueRunning) processServerQueue();
+  });
+}
+
+function processServerQueue() {
+  if (_serverQueue.length === 0) {
+    _serverQueueRunning = false;
+    _serverQueueTotal = 0;
+    _serverQueueDone = 0;
+    hideSpinner();
+    return;
+  }
+  _serverQueueRunning = true;
+  var item = _serverQueue.shift();
+  _serverQueueDone++;
+  var label = _serverQueueTotal > 1 ? ('File ' + _serverQueueDone + ' of ' + _serverQueueTotal) : '';
+  if (label) updateSpinner('Processing ' + label + '…', item.file.name, Math.round((_serverQueueDone - 1) / _serverQueueTotal * 100));
+
+  renderViaServer(item.file, item.dpi, item.quality, item.pages).then(function(data) {
+    item.resolve(data);
+    processServerQueue();
+  }).catch(function(err) {
+    item.reject(err);
+    processServerQueue();
+  });
+}
+
+// Check if file should use server rendering (hybrid threshold)
+function shouldUseServer(file) {
+  return file.size >= GS_THRESHOLD_MB * 1024 * 1024;
+}
+
 function renderPdfPageToImage(file, pageNum) {
   return file.arrayBuffer().then(function(arrayBuf) {
     var rawBytes = new Uint8Array(arrayBuf);
@@ -3340,9 +3658,9 @@ function renderPdfPageToImage(file, pageNum) {
         var dpi = longestIn > 70 ? 110 : 150;
         var maxPixels = 40000000;
         var targetScale = dpi / 72;
-        // Ensure at least 2400px on longest side for proof quality
+        // Ensure at least 1800px on longest side for proof quality
         // (critical for scaled-down vector files that are physically small)
-        var minProofPx = 2400;
+        var minProofPx = 1800;
         var currentLongPx = Math.max(vp.width, vp.height) * targetScale;
         if (currentLongPx < minProofPx) {
           targetScale = minProofPx / Math.max(vp.width, vp.height);
@@ -3470,26 +3788,71 @@ function renderPdfPageToImage(file, pageNum) {
           }
 
           var finalCanvas = croppedCanvas;
-          var maxPx = 2400;
-          if (Math.max(finalCanvas.width, finalCanvas.height) > maxPx) {
+          var maxPx = 1800;
+          var pdfNeedsResize = Math.max(finalCanvas.width, finalCanvas.height) > maxPx;
+          var pdfResizePromise;
+          if (pdfNeedsResize) {
             var ratio = maxPx / Math.max(finalCanvas.width, finalCanvas.height);
             var nw = Math.floor(finalCanvas.width * ratio);
             var nh = Math.floor(finalCanvas.height * ratio);
-            var resized = document.createElement('canvas');
-            resized.width = nw;
-            resized.height = nh;
-            resized.getContext('2d').drawImage(finalCanvas, 0, 0, nw, nh);
-            finalCanvas = resized;
+            pdfResizePromise = createImageBitmap(finalCanvas, { resizeWidth: nw, resizeHeight: nh, resizeQuality: 'high' }).then(function(bmp) {
+              var resized = document.createElement('canvas');
+              resized.width = nw; resized.height = nh;
+              resized.getContext('2d').drawImage(bmp, 0, 0);
+              bmp.close();
+              return resized;
+            });
+          } else {
+            pdfResizePromise = Promise.resolve(finalCanvas);
           }
 
+          return pdfResizePromise.then(function(finalCanvas) {
           applyCMYKSimulation(finalCanvas);
-          var imgDataUrl = finalCanvas.toDataURL('image/jpeg', 0.82);
+          var imgDataUrl = finalCanvas.toDataURL('image/jpeg', 0.85);
           var totalPages = pdf.numPages;
           pdf.destroy();
           return { imgDataUrl: imgDataUrl, widthIn: widthIn, heightIn: heightIn, imgPixW: finalCanvas.width, imgPixH: finalCanvas.height, hasWhiteEdges: hasWhiteEdges, totalPages: totalPages, trimBox: trimBox, spotColors: spotColors, dieLineBox: dieLineBox, _rawBytes: rawBytesCopy };
+          }); // end pdfResizePromise.then
         });
       });
     });
+  });
+}
+
+// ── Downsample a data URL to target DPI at proof-sheet draw size ──
+// Returns a Promise<dataUrl>. If the image is already at or below
+// targetDpi it resolves immediately with the original.
+var PROOF_TARGET_DPI = 300;
+function downsampleForProof(dataUrl, drawW, drawH) {
+  var targetW = Math.ceil(drawW * PROOF_TARGET_DPI);
+  var targetH = Math.ceil(drawH * PROOF_TARGET_DPI);
+  return new Promise(function(resolve) {
+    var img = new Image();
+    img.onload = function() {
+      var srcW = img.naturalWidth, srcH = img.naturalHeight;
+      // Only downsample — never upscale
+      if (srcW <= targetW && srcH <= targetH) { resolve(dataUrl); return; }
+      // Fit within target keeping aspect ratio
+      var ratio = Math.min(targetW / srcW, targetH / srcH);
+      var nw = Math.round(srcW * ratio);
+      var nh = Math.round(srcH * ratio);
+      // High-quality resize via createImageBitmap
+      createImageBitmap(img, { resizeWidth: nw, resizeHeight: nh, resizeQuality: 'high' }).then(function(bmp) {
+        var c = document.createElement('canvas');
+        c.width = nw; c.height = nh;
+        c.getContext('2d').drawImage(bmp, 0, 0);
+        bmp.close();
+        resolve(c.toDataURL('image/jpeg', 0.85));
+      }).catch(function() {
+        // Fallback: drawImage resize
+        var c = document.createElement('canvas');
+        c.width = nw; c.height = nh;
+        c.getContext('2d').drawImage(img, 0, 0, nw, nh);
+        resolve(c.toDataURL('image/jpeg', 0.85));
+      });
+    };
+    img.onerror = function() { resolve(dataUrl); };
+    img.src = dataUrl;
   });
 }
 
@@ -4179,8 +4542,8 @@ function showResolutionWarning(lowResItems) {
     }
 
     document.getElementById('res-stop').onclick = function() { cleanup(); resolve('stop'); };
-    document.getElementById('res-bypass').onclick = function() { cleanup(); resolve('bypass'); };
-    document.getElementById('res-continue').onclick = function() { cleanup(); resolve('continue'); };
+    document.getElementById('res-bypass').onclick = function() { cleanup(); startDelayedSpin(); resolve('bypass'); };
+    document.getElementById('res-continue').onclick = function() { cleanup(); startDelayedSpin(); resolve('continue'); };
   });
 }
 
@@ -4394,7 +4757,8 @@ window.generateProof = function() {
       if (lowRes.length > 0) {
         progressOverlay.classList.remove('active');
         showResolutionWarning(lowRes).then(function(choice) {
-          if (choice === 'stop') { return; }
+          if (choice === 'stop') { cancelDelayedSpin(); return; }
+          cancelDelayedSpin();
           progressOverlay.classList.add('active');
           var resNote = (choice === 'continue') ? buildResNote(allRes) : null;
           var hideRes = (choice === 'bypass');
@@ -4477,7 +4841,63 @@ window.generateProof = function() {
         }
         return Promise.resolve(rasterResult);
       } else {
-        return renderPdfPageToImage(item.file, item.pageNum).then(function(result) {
+        // ── Hybrid rendering: use server for large files, browser for small ──
+        var useServer = shouldUseServer(item.file);
+        if (useServer) {
+          return queueServerRender(item.file, 150, 95, String(item.pageNum)).then(function(serverData) {
+            if (!serverData.pages || serverData.pages.length === 0) {
+              throw new Error('Server returned no pages');
+            }
+            var serverImg = serverData.pages[0];
+            // Still need metadata from raw bytes (trim box, spots, die lines)
+            return item.file.arrayBuffer().then(function(buf) {
+              var rawBytes = new Uint8Array(buf);
+              var allTrimBoxes = findTrimBox(rawBytes);
+              var spotColors = findSpotColors(rawBytes);
+              var vp72w = 0, vp72h = 0;
+              // Estimate page dimensions from first TrimBox or PDF MediaBox
+              if (allTrimBoxes.length > 0) {
+                vp72w = allTrimBoxes[0].widthIn;
+                vp72h = allTrimBoxes[0].heightIn;
+              }
+              // Create an <img> to get actual pixel dimensions
+              return new Promise(function(resolve) {
+                var img = new Image();
+                img.onload = function() {
+                  var pw = img.naturalWidth, ph = img.naturalHeight;
+                  // If we don't have page dims from TrimBox, estimate from rendered pixels at 150 DPI
+                  if (!vp72w) { vp72w = pw / 150; vp72h = ph / 150; }
+                  var trimBox = allTrimBoxes.length > 0 ? allTrimBoxes[0] : null;
+                  resolve({
+                    imgDataUrl: serverImg.dataUrl,
+                    widthIn: vp72w,
+                    heightIn: vp72h,
+                    imgPixW: pw,
+                    imgPixH: ph,
+                    hasWhiteEdges: true,
+                    totalPages: serverData.pages.length,
+                    trimBox: trimBox,
+                    spotColors: spotColors,
+                    dieLineBox: null,
+                    _serverRendered: true
+                  });
+                };
+                img.onerror = function() {
+                  resolve({
+                    imgDataUrl: serverImg.dataUrl,
+                    widthIn: vp72w || 11,
+                    heightIn: vp72h || 8.5,
+                    hasWhiteEdges: true,
+                    totalPages: serverData.pages.length,
+                    trimBox: null,
+                    spotColors: spotColors,
+                    _serverRendered: true
+                  });
+                };
+                img.src = serverImg.dataUrl;
+              });
+            });
+          }).then(function(result) {
           var classifyPromise;
           // If white plate file is already attached (via + WP all pages), auto-classify
           // white spots without showing the file picker for them
@@ -4496,7 +4916,7 @@ window.generateProof = function() {
           if (result.spotColors && result.spotColors.some(function(sc) { return sc.needsClassification; })) {
             progressOverlay.classList.remove('active');
             classifyPromise = showSpotColorClassification(result.spotColors).then(function(classified) {
-              progressOverlay.classList.add('active');
+              cancelDelayedSpin(); progressOverlay.classList.add('active');
               result.spotColors = classified;
             });
           } else {
@@ -4549,7 +4969,82 @@ window.generateProof = function() {
             delete result._rawBytes;
             return result;
           });
+          });
+        } else {
+        // ── Browser rendering for smaller files ──
+        return renderPdfPageToImage(item.file, item.pageNum).then(function(result) {
+          var classifyPromise;
+          // If white plate file is already attached (via + WP all pages), auto-classify
+          // white spots without showing the file picker for them
+          if (item.whitePlateFile && result.spotColors) {
+            result.spotColors.forEach(function(sc) {
+              if (sc.needsClassification) {
+                var rawLower = sc.rawName.replace(/[\s_-]/g, '').toLowerCase();
+                if (/^(opw\d*|white|spotwhite|whiteink|opaquewhite)$/.test(rawLower)) {
+                  sc.type = 'white';
+                  sc.needsClassification = false;
+                  _spotClassificationCache[sc.key] = { type: 'white' };
+                }
+              }
+            });
+          }
+          if (result.spotColors && result.spotColors.some(function(sc) { return sc.needsClassification; })) {
+            progressOverlay.classList.remove('active');
+            classifyPromise = showSpotColorClassification(result.spotColors).then(function(classified) {
+              cancelDelayedSpin(); progressOverlay.classList.add('active');
+              result.spotColors = classified;
+            });
+          } else {
+            classifyPromise = Promise.resolve();
+          }
+
+          return classifyPromise.then(function() {
+            if (item.whitePlateFile) {
+              return loadWhitePlateFile(item.whitePlateFile, item.whitePlatePageNum).then(function(thumb) {
+                if (thumb) {
+                  if (!thumb.spotName) thumb.spotName = item.whitePlateFile.name;
+                  if (result.spotColors) {
+                    result.spotColors.forEach(function(sc) {
+                      if (sc.type === 'white') thumb.spotName = sc.rawName;
+                    });
+                  }
+                  result.whitePlateThumb = thumb;
+                }
+                delete result._rawBytes;
+                return result;
+              });
+            }
+
+            var whiteSpotKey = null;
+            if (result.spotColors) {
+              result.spotColors.forEach(function(sc) {
+                if (sc.type === 'white') whiteSpotKey = sc.key;
+              });
+            }
+            var cached = whiteSpotKey ? _spotClassificationCache[whiteSpotKey] : null;
+            var hasUserWpFile = cached && cached.wpFiles && cached.wpFileIndex < cached.wpFiles.length;
+
+            if (hasUserWpFile) {
+              var wpFile = cached.wpFiles[cached.wpFileIndex];
+              cached.wpFileIndex++;
+              return loadWhitePlateFile(wpFile).then(function(thumb) {
+                if (thumb) {
+                  thumb.spotName = whiteSpotKey || 'OPW';
+                  result.spotColors.forEach(function(sc) {
+                    if (sc.type === 'white') thumb.spotName = sc.rawName;
+                  });
+                  result.whitePlateThumb = thumb;
+                }
+                delete result._rawBytes;
+                return result;
+              });
+            }
+
+            delete result._rawBytes;
+            return result;
+          });
         });
+        } // end else (browser path)
       }
     }
 
@@ -4590,6 +5085,48 @@ window.generateProof = function() {
             if (parsed) { sheetScale = parsed.toString(); sheetScaleRaw = perScaleStr.trim(); }
           }
 
+          // ── Downsample images to ~300 DPI at proof-sheet draw size ──
+          var hasWPFront = frontImg.whitePlateThumb != null;
+          var hasWPBack = backImg && backImg.whitePlateThumb != null;
+          var panelCount = 1;
+          if (backImg) panelCount++;
+          if (hasWPFront) panelCount++;
+          if (hasWPBack && !(sheet.sameArt)) panelCount++;
+          // Replicate drawProofPage layout math to get per-panel draw size
+          var _PW = panelCount >= 4 ? 17 : (panelCount >= 3 ? 14 : 11);
+          var _M = 0.5;
+          var _rpW = 2.8;
+          var _artW = _PW - _M - _rpW - _M - 0.3;
+          var _artH = 8.5 - 2 * _M;
+          var _dimM = 0.35;
+          var _gap = panelCount > 2 ? 0.15 : 0.2;
+          var slotW, availH;
+          if (panelCount >= 2) {
+            slotW = (_artW - _dimM - _gap * (panelCount - 1)) / panelCount;
+            availH = _artH - _dimM - 0.55;
+          } else {
+            slotW = _artW - _dimM;
+            availH = _artH - _dimM - 0.3;
+          }
+          // Fit image aspect into slot
+          var imgAsp = (frontImg.imgPixW || frontImg.widthIn) / (frontImg.imgPixH || frontImg.heightIn);
+          var dW = slotW, dH = slotW / imgAsp;
+          if (dH > availH) { dH = availH; dW = dH * imgAsp; }
+
+          // Build list of downsample tasks
+          var tasks = [];
+          tasks.push(downsampleForProof(frontImg.imgDataUrl, dW, dH).then(function(url) { frontImg.imgDataUrl = url; }));
+          if (backImg && backImg !== frontImg) {
+            tasks.push(downsampleForProof(backImg.imgDataUrl, dW, dH).then(function(url) { backImg.imgDataUrl = url; }));
+          }
+          if (hasWPFront) {
+            tasks.push(downsampleForProof(frontImg.whitePlateThumb.dataUrl, dW, dH).then(function(url) { frontImg.whitePlateThumb.dataUrl = url; }));
+          }
+          if (hasWPBack && backImg && !(sheet.sameArt)) {
+            tasks.push(downsampleForProof(backImg.whitePlateThumb.dataUrl, dW, dH).then(function(url) { backImg.whitePlateThumb.dataUrl = url; }));
+          }
+
+          Promise.all(tasks).then(function() {
           drawProofPage(doc, frontImg, {
             clientName: clientName, jobNumber: jobNumber, date: date, qty: sheetQty,
             substrate: gm.substrate, printType: gm.printType, scale: sheetScale, scaleRaw: sheetScaleRaw, finishing: gm.finishing,
@@ -4604,6 +5141,7 @@ window.generateProof = function() {
 
           sheetIdx++;
           setTimeout(renderNextSheet, 10);
+          });
         }
 
         if (sheet.back) {
@@ -4643,6 +5181,7 @@ window.generateProof = function() {
       initPreviewViewer(blob);
 
       progressOverlay.classList.remove('active');
+      cancelDelayedSpin();
       document.getElementById('form-section').style.display = 'none';
       document.getElementById('result-section').classList.add('active');
     }
@@ -4749,7 +5288,7 @@ window.resetForm = function() {
 };
 
 } catch(err) {
-  alert('Proof Sheet Generator error: ' + err.message);
+  alert('Proofmaker Pro error: ' + err.message);
   console.error(err);
 }
 }); // end DOMContentLoaded
