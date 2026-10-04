@@ -3625,9 +3625,26 @@ var _serverQueueRunning = false;
 var _serverQueueTotal = 0;
 var _serverQueueDone = 0;
 
+// ── Server render cache: reuse results on Edit & Regenerate ──
+// Keyed by file name + size + lastModified + page param.
+// Persists until page refresh. Saves Fly.io round-trips.
+var _serverRenderCache = {};
+
+function _cacheKey(file, pages) {
+  return file.name + '|' + file.size + '|' + file.lastModified + '|' + (pages || 'all');
+}
+
 function queueServerRender(file, dpi, quality, pages) {
+  var key = _cacheKey(file, pages);
+  if (_serverRenderCache[key]) {
+    console.log('Server cache hit: ' + file.name + ' page=' + pages);
+    return Promise.resolve(_serverRenderCache[key]);
+  }
   return new Promise(function(resolve, reject) {
-    _serverQueue.push({ file: file, dpi: dpi, quality: quality, pages: pages, resolve: resolve, reject: reject });
+    _serverQueue.push({ file: file, dpi: dpi, quality: quality, pages: pages, resolve: function(data) {
+      _serverRenderCache[key] = data;
+      resolve(data);
+    }, reject: reject });
     _serverQueueTotal = _serverQueue.length + _serverQueueDone;
     if (!_serverQueueRunning) processServerQueue();
   });
