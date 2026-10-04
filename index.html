@@ -605,7 +605,7 @@ header p { color: #86868b; font-size: 14px; margin-top: 6px; }
   </button>
 
   <div class="footer">
-    Everything runs in your browser — no files are uploaded anywhere
+    Files are sent to our render server for color-accurate proofing — nothing is stored
   </div>
 </div>
 
@@ -1718,25 +1718,48 @@ function processRasterFile(file) {
     // to the directory, and RATIONAL resolution values sit near it).
     var headerSize = isTiff
       ? Math.min(file.size, 4 * 1024 * 1024)   // 4 MB for TIFF
-      : Math.min(file.size, 1024 * 1024);        // 1 MB for JPEG/PNG (large ICC profiles push metadata further)
+      : Math.min(file.size, 2 * 1024 * 1024);      // 2 MB for JPEG/PNG (large ICC profiles can push SOF past 700KB)
 
     file.slice(0, headerSize).arrayBuffer().then(function(headerBuf) {
       var uint8 = new Uint8Array(headerBuf);
       var dpi = detectDpiFromBytes(uint8, file.name) || 0;
 
       // Detect CMYK JPEG: find SOF marker and check if num_components === 4
-      // Also extract pixel dimensions from SOF for pixel-count threshold
+      // Also extract pixel dimensions from SOF for pixel-count threshold.
+      // IMPORTANT: walk the JPEG marker structure properly — a naive byte scan
+      // for 0xFF 0xC0 can hit false positives inside ICC profiles or EXIF data.
       var _isCMYK = false;
       var _sofW = 0, _sofH = 0;
       if (!isTiff) {
-        for (var ci = 0; ci < uint8.length - 10; ci++) {
-          if (uint8[ci] === 0xFF && uint8[ci+1] >= 0xC0 && uint8[ci+1] <= 0xC3 && uint8[ci+1] !== 0xC4) {
-            _sofH = (uint8[ci+5] << 8) | uint8[ci+6];
-            _sofW = (uint8[ci+7] << 8) | uint8[ci+8];
-            if (uint8[ci+9] === 4) _isCMYK = true;
-            break;
+        (function() {
+          var pos = 0;
+          // Verify JPEG SOI marker
+          if (uint8[0] !== 0xFF || uint8[1] !== 0xD8) return;
+          pos = 2;
+          while (pos < uint8.length - 10) {
+            // Find next marker
+            if (uint8[pos] !== 0xFF) { pos++; continue; }
+            // Skip padding FFs
+            while (pos < uint8.length - 1 && uint8[pos + 1] === 0xFF) pos++;
+            var marker = uint8[pos + 1];
+            pos += 2;
+            // Standalone markers (no length field)
+            if (marker === 0xD8 || marker === 0xD9 || (marker >= 0xD0 && marker <= 0xD7)) continue;
+            // SOF markers: 0xC0-0xC3 (excluding 0xC4 which is DHT)
+            if (marker >= 0xC0 && marker <= 0xC3) {
+              // pos is now at the length field of the SOF segment
+              _sofH = (uint8[pos + 3] << 8) | uint8[pos + 4];
+              _sofW = (uint8[pos + 5] << 8) | uint8[pos + 6];
+              if (uint8[pos + 7] === 4) _isCMYK = true;
+              break;
+            }
+            // Skip this marker's data segment
+            if (pos + 1 >= uint8.length) break;
+            var segLen = (uint8[pos] << 8) | uint8[pos + 1];
+            if (segLen < 2) break;
+            pos += segLen;
           }
-        }
+        })();
       }
       // Stash on file for downstream use
       file._isCMYK = _isCMYK;
@@ -1861,21 +1884,10 @@ function processRasterFile(file) {
           var dimUrl = URL.createObjectURL(file);
           var dimImg = new Image();
           var dimTimeout = setTimeout(function() {
-            // If image hasn't loaded in 5s, try to get dims from header bytes
+            // If image hasn't loaded in 5s, use SOF dims if available
             URL.revokeObjectURL(dimUrl);
-            var estPixW = 0, estPixH = 0;
-            // Parse JPEG SOF marker for dimensions
-            try {
-              for (var si = 0; si < uint8.length - 10; si++) {
-                if (uint8[si] === 0xFF && (uint8[si+1] >= 0xC0 && uint8[si+1] <= 0xC3) && uint8[si+1] !== 0xC4) {
-                  estPixH = (uint8[si+5] << 8) | uint8[si+6];
-                  estPixW = (uint8[si+7] << 8) | uint8[si+8];
-                  if (estPixW > 0 && estPixH > 0) break;
-                }
-              }
-            } catch(e) {}
-            if (estPixW > 0) {
-              showRasterModal(file, estPixW, estPixH, dpi, null).then(function(result) {
+            if (_sofW > 0 && _sofH > 0) {
+              showRasterModal(file, _sofW, _sofH, dpi, null).then(function(result) {
                 resolve(result);
               }).catch(function() { resolve(null); });
             } else {
@@ -4862,86 +4874,73 @@ window.generateProof = function() {
     // Helper: get image data for a page plan item (PDF or raster)
     function getPageImage(item) {
       if (item.type === 'raster') {
-        // Check if this raster file is a CMYK JPEG — if so, re-render via GS server
-        // (browser's native JPEG decoder botches CMYK color conversion)
-        if (item.rasterMeta && item.rasterMeta.isCMYK) {
-          return queueServerRender(item.file, 150, 95, '1').then(function(serverData) {
-            if (!serverData.pages || serverData.pages.length === 0) {
-              throw new Error('Server returned no pages for CMYK raster');
-            }
-            var serverImg = serverData.pages[0];
-            return new Promise(function(resolve) {
-              var img = new Image();
-              img.onload = function() {
-                var rm = item.rasterMeta;
-                resolve({
-                  imgDataUrl: serverImg.dataUrl,
-                  widthIn: rm.widthIn,
-                  heightIn: rm.heightIn,
-                  imgPixW: img.naturalWidth,
-                  imgPixH: img.naturalHeight,
-                  hasWhiteEdges: rm.hasWhiteEdges,
-                  totalPages: 1,
-                  trimBox: rm.bleed > 0 ? { widthIn: rm.trimW, heightIn: rm.trimH } : null,
-                  spotColors: [],
-                  rasterInfo: { dpi: rm.dpi, pixW: rm.pixW, pixH: rm.pixH, bleed: rm.bleed },
-                  _serverRendered: true
-                });
-              };
-              img.onerror = function() {
-                // Fall back to browser-rendered version
-                resolve({
-                  imgDataUrl: item.rasterMeta.imgDataUrl,
-                  widthIn: rm.widthIn,
-                  heightIn: rm.heightIn,
-                  hasWhiteEdges: rm.hasWhiteEdges,
-                  totalPages: 1,
-                  trimBox: rm.bleed > 0 ? { widthIn: rm.trimW, heightIn: rm.trimH } : null,
-                  spotColors: [],
-                  rasterInfo: { dpi: rm.dpi, pixW: rm.pixW, pixH: rm.pixH, bleed: rm.bleed }
-                });
-              };
-              img.src = serverImg.dataUrl;
-            });
-          }).catch(function(serverErr) {
-            // Server render failed — fall back to browser-decoded image
-            // (colors may be off for CMYK, but at least the proof won't be blank)
-            console.warn('CMYK server render failed, using browser fallback:', serverErr);
-            var rm = item.rasterMeta;
-            return {
-              imgDataUrl: rm.imgDataUrl,
-              widthIn: rm.widthIn,
-              heightIn: rm.heightIn,
-              hasWhiteEdges: rm.hasWhiteEdges,
-              totalPages: 1,
-              trimBox: rm.bleed > 0 ? { widthIn: rm.trimW, heightIn: rm.trimH } : null,
-              spotColors: [],
-              rasterInfo: { dpi: rm.dpi, pixW: rm.pixW, pixH: rm.pixH, bleed: rm.bleed }
+        // ── Route ALL raster files through the GS server ──
+        // Server handles CMYK→sRGB via PDF wrapper + Ghostscript (proper ICC color management),
+        // and RGB files via ImageMagick. Consistent quality for everything.
+        return queueServerRender(item.file, 150, 95, '1').then(function(serverData) {
+          if (!serverData.pages || serverData.pages.length === 0) {
+            throw new Error('Server returned no pages for raster');
+          }
+          var serverImg = serverData.pages[0];
+          return new Promise(function(resolve) {
+            var img = new Image();
+            img.onload = function() {
+              var rm = item.rasterMeta;
+              resolve({
+                imgDataUrl: serverImg.dataUrl,
+                widthIn: rm.widthIn,
+                heightIn: rm.heightIn,
+                imgPixW: img.naturalWidth,
+                imgPixH: img.naturalHeight,
+                hasWhiteEdges: rm.hasWhiteEdges,
+                totalPages: 1,
+                trimBox: rm.bleed > 0 ? { widthIn: rm.trimW, heightIn: rm.trimH } : null,
+                spotColors: [],
+                rasterInfo: { dpi: rm.dpi, pixW: rm.pixW, pixH: rm.pixH, bleed: rm.bleed },
+                _serverRendered: true
+              });
             };
+            img.onerror = function() {
+              // Fall back to browser-rendered version
+              var rm = item.rasterMeta;
+              resolve({
+                imgDataUrl: rm.imgDataUrl,
+                widthIn: rm.widthIn,
+                heightIn: rm.heightIn,
+                hasWhiteEdges: rm.hasWhiteEdges,
+                totalPages: 1,
+                trimBox: rm.bleed > 0 ? { widthIn: rm.trimW, heightIn: rm.trimH } : null,
+                spotColors: [],
+                rasterInfo: { dpi: rm.dpi, pixW: rm.pixW, pixH: rm.pixH, bleed: rm.bleed }
+              });
+            };
+            img.src = serverImg.dataUrl;
           });
-        }
-        var rm = item.rasterMeta;
-        var rasterResult = {
-          imgDataUrl: rm.imgDataUrl,
-          widthIn: rm.widthIn,
-          heightIn: rm.heightIn,
-          hasWhiteEdges: rm.hasWhiteEdges,
-          totalPages: 1,
-          trimBox: rm.bleed > 0 ? { widthIn: rm.trimW, heightIn: rm.trimH } : null,
-          spotColors: [],
-          rasterInfo: { dpi: rm.dpi, pixW: rm.pixW, pixH: rm.pixH, bleed: rm.bleed }
-        };
-        if (item.whitePlateFile) {
-          return loadWhitePlateFile(item.whitePlateFile, item.whitePlatePageNum).then(function(thumb) {
-            if (thumb) {
-              // Prefer spot name from the PDF's Separation CS, fall back to filename
-              if (!thumb.spotName) thumb.spotName = item.whitePlateFile.name;
-              rasterResult.whitePlateThumb = thumb;
-            }
-            return rasterResult;
-          });
-        }
-        return Promise.resolve(rasterResult);
+        }).catch(function(serverErr) {
+          // Server render failed — fall back to browser-decoded image
+          console.warn('Server render failed for raster, using browser fallback:', serverErr);
+          var rm = item.rasterMeta;
+          var rasterResult = {
+            imgDataUrl: rm.imgDataUrl,
+            widthIn: rm.widthIn,
+            heightIn: rm.heightIn,
+            hasWhiteEdges: rm.hasWhiteEdges,
+            totalPages: 1,
+            trimBox: rm.bleed > 0 ? { widthIn: rm.trimW, heightIn: rm.trimH } : null,
+            spotColors: [],
+            rasterInfo: { dpi: rm.dpi, pixW: rm.pixW, pixH: rm.pixH, bleed: rm.bleed }
+          };
+          if (item.whitePlateFile) {
+            return loadWhitePlateFile(item.whitePlateFile, item.whitePlatePageNum).then(function(thumb) {
+              if (thumb) {
+                if (!thumb.spotName) thumb.spotName = item.whitePlateFile.name;
+                rasterResult.whitePlateThumb = thumb;
+              }
+              return rasterResult;
+            });
+          }
+          return rasterResult;
+        });
       } else {
         // ── Always use GS server for PDFs — proper color management ──
         // and consistent rendering of blends, gradients, and complex artwork
