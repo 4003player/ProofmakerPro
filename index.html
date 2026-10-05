@@ -3678,6 +3678,58 @@ function shouldUseServer(file) {
   return file.size >= GS_THRESHOLD_MB * 1024 * 1024;
 }
 
+// ── /wrap endpoint: get a CMYK PDF wrapper for raster files ──
+// Returns the PDF as an ArrayBuffer. PDF.js renders it with the same
+// naive CMYK→RGB formula as user-supplied PDFs = "numbers in = numbers out".
+function renderViaWrap(file, dpi) {
+  dpi = dpi || 150;
+  var sizeMB = (file.size / 1024 / 1024).toFixed(1);
+  showSpinner('Wrapping in CMYK PDF…', file.name + ' (' + sizeMB + ' MB)');
+
+  return new Promise(function(resolve, reject) {
+    var url = GS_SERVER_URL + '/wrap?dpi=' + dpi;
+    var formData = new FormData();
+    formData.append('file', file);
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', url);
+    xhr.responseType = 'arraybuffer';
+
+    xhr.upload.onprogress = function(e) {
+      if (e.lengthComputable) {
+        var pct = Math.round(e.loaded / e.total * 100);
+        if (pct < 100) {
+          updateSpinner('Uploading…', file.name + ' — ' + pct + '%', pct);
+        } else {
+          updateSpinner('Wrapping in PDF…', file.name, 100);
+        }
+      }
+    };
+
+    xhr.onload = function() {
+      hideSpinner();
+      if (xhr.status !== 200) {
+        try {
+          var errData = JSON.parse(new TextDecoder().decode(xhr.response));
+          reject(new Error(errData.error + ': ' + (errData.detail || '')));
+        } catch(e) {
+          reject(new Error('Server error ' + xhr.status));
+        }
+        return;
+      }
+      console.log('CMYK PDF wrapper received: ' + (xhr.response.byteLength / 1024).toFixed(1) + ' KB');
+      resolve(xhr.response); // ArrayBuffer of PDF bytes
+    };
+
+    xhr.onerror = function() {
+      hideSpinner();
+      reject(new Error('Network error'));
+    };
+
+    xhr.send(formData);
+  });
+}
+
 // Quick scan of PDF raw bytes for CMYK image XObjects.
 // PDF.js converts CMYK→RGB with a naive formula that bands smooth blends;
 // Ghostscript uses proper ICC color management. Returns true if any
@@ -4888,76 +4940,131 @@ window.generateProof = function() {
     var doc = new jsPDF({ orientation: 'landscape', unit: 'in', format: [8.5, 11] });
     var sheetIdx = 0;
 
+    // Helper: render a raster file via GS /render (JPEG and fallback path)
+    function _getPageImageViaRender(item) {
+      return queueServerRender(item.file, 150, 95, '1').then(function(serverData) {
+        if (!serverData.pages || serverData.pages.length === 0) {
+          throw new Error('Server returned no pages for raster');
+        }
+        var serverImg = serverData.pages[0];
+        return new Promise(function(resolve) {
+          var img = new Image();
+          img.onload = function() {
+            var rm = item.rasterMeta;
+            resolve({
+              imgDataUrl: serverImg.dataUrl,
+              widthIn: rm.widthIn,
+              heightIn: rm.heightIn,
+              imgPixW: img.naturalWidth,
+              imgPixH: img.naturalHeight,
+              hasWhiteEdges: rm.hasWhiteEdges,
+              totalPages: 1,
+              trimBox: rm.bleed > 0 ? { widthIn: rm.trimW, heightIn: rm.trimH } : null,
+              spotColors: [],
+              rasterInfo: { dpi: rm.dpi, pixW: rm.pixW, pixH: rm.pixH, bleed: rm.bleed },
+              _serverRendered: true
+            });
+          };
+          img.onerror = function() {
+            var rm = item.rasterMeta;
+            resolve({
+              imgDataUrl: rm.imgDataUrl,
+              widthIn: rm.widthIn,
+              heightIn: rm.heightIn,
+              hasWhiteEdges: rm.hasWhiteEdges,
+              totalPages: 1,
+              trimBox: rm.bleed > 0 ? { widthIn: rm.trimW, heightIn: rm.trimH } : null,
+              spotColors: [],
+              rasterInfo: { dpi: rm.dpi, pixW: rm.pixW, pixH: rm.pixH, bleed: rm.bleed }
+            });
+          };
+          img.src = serverImg.dataUrl;
+        });
+      }).catch(function(serverErr) {
+        console.warn('Server render failed for raster, using browser fallback:', serverErr);
+        var rm = item.rasterMeta;
+        var rasterResult = {
+          imgDataUrl: rm.imgDataUrl,
+          widthIn: rm.widthIn,
+          heightIn: rm.heightIn,
+          hasWhiteEdges: rm.hasWhiteEdges,
+          totalPages: 1,
+          trimBox: rm.bleed > 0 ? { widthIn: rm.trimW, heightIn: rm.trimH } : null,
+          spotColors: [],
+          rasterInfo: { dpi: rm.dpi, pixW: rm.pixW, pixH: rm.pixH, bleed: rm.bleed }
+        };
+        if (item.whitePlateFile) {
+          return loadWhitePlateFile(item.whitePlateFile, item.whitePlatePageNum).then(function(thumb) {
+            if (thumb) {
+              if (!thumb.spotName) thumb.spotName = item.whitePlateFile.name;
+              rasterResult.whitePlateThumb = thumb;
+            }
+            return rasterResult;
+          });
+        }
+        return rasterResult;
+      });
+    }
+
     // Helper: get image data for a page plan item (PDF or raster)
     function getPageImage(item) {
       if (item.type === 'raster') {
-        // ── Route ALL raster files through the GS server ──
-        // Server handles CMYK→sRGB via PDF wrapper + Ghostscript (proper ICC color management),
-        // and RGB files via ImageMagick. Consistent quality for everything.
-        return queueServerRender(item.file, 150, 95, '1').then(function(serverData) {
-          if (!serverData.pages || serverData.pages.length === 0) {
-            throw new Error('Server returned no pages for raster');
-          }
-          var serverImg = serverData.pages[0];
-          return new Promise(function(resolve) {
-            var img = new Image();
-            img.onload = function() {
-              var rm = item.rasterMeta;
-              resolve({
-                imgDataUrl: serverImg.dataUrl,
-                widthIn: rm.widthIn,
-                heightIn: rm.heightIn,
-                imgPixW: img.naturalWidth,
-                imgPixH: img.naturalHeight,
-                hasWhiteEdges: rm.hasWhiteEdges,
-                totalPages: 1,
-                trimBox: rm.bleed > 0 ? { widthIn: rm.trimW, heightIn: rm.trimH } : null,
-                spotColors: [],
-                rasterInfo: { dpi: rm.dpi, pixW: rm.pixW, pixH: rm.pixH, bleed: rm.bleed },
-                _serverRendered: true
+        var rm = item.rasterMeta;
+        var lower = item.filename.toLowerCase();
+        var isTiffFile = lower.endsWith('.tif') || lower.endsWith('.tiff');
+
+        if (isTiffFile) {
+          // ── TIFF: wrap in CMYK PDF → render via PDF.js ──
+          // "Numbers in = numbers out" — same pipeline as user-supplied PDFs.
+          // PDF.js uses the naive CMYK→RGB formula that matches every PDF viewer,
+          // so the proof shows exact CMYK values.
+          return renderViaWrap(item.file, rm.dpi).then(function(pdfArrayBuf) {
+            var pdfBytes = new Uint8Array(pdfArrayBuf);
+            var bufCopy = pdfArrayBuf.slice ? pdfArrayBuf.slice(0) : new Uint8Array(pdfArrayBuf).buffer;
+            return pdfjsLib.getDocument({ data: bufCopy }).promise.then(function(pdf) {
+              return pdf.getPage(1).then(function(page) {
+                var vp = page.getViewport({ scale: 1.0 });
+                var widthIn = vp.width / 72;
+                var heightIn = vp.height / 72;
+                // Render at ~150 DPI for proof quality
+                var targetScale = 150 / 72;
+                var maxPx = 16000000;
+                while (vp.width * targetScale * vp.height * targetScale > maxPx && targetScale > 0.5) {
+                  targetScale *= 0.7;
+                }
+                var renderVp = page.getViewport({ scale: targetScale });
+                var canvas = document.createElement('canvas');
+                canvas.width = renderVp.width;
+                canvas.height = renderVp.height;
+                var ctx = canvas.getContext('2d');
+                return page.render({ canvasContext: ctx, viewport: renderVp }).promise.then(function() {
+                  pdf.destroy();
+                  var dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+                  return {
+                    imgDataUrl: dataUrl,
+                    widthIn: rm.widthIn,
+                    heightIn: rm.heightIn,
+                    imgPixW: canvas.width,
+                    imgPixH: canvas.height,
+                    hasWhiteEdges: rm.hasWhiteEdges,
+                    totalPages: 1,
+                    trimBox: rm.bleed > 0 ? { widthIn: rm.trimW, heightIn: rm.trimH } : null,
+                    spotColors: [],
+                    rasterInfo: { dpi: rm.dpi, pixW: rm.pixW, pixH: rm.pixH, bleed: rm.bleed },
+                    _serverRendered: true
+                  };
+                });
               });
-            };
-            img.onerror = function() {
-              // Fall back to browser-rendered version
-              var rm = item.rasterMeta;
-              resolve({
-                imgDataUrl: rm.imgDataUrl,
-                widthIn: rm.widthIn,
-                heightIn: rm.heightIn,
-                hasWhiteEdges: rm.hasWhiteEdges,
-                totalPages: 1,
-                trimBox: rm.bleed > 0 ? { widthIn: rm.trimW, heightIn: rm.trimH } : null,
-                spotColors: [],
-                rasterInfo: { dpi: rm.dpi, pixW: rm.pixW, pixH: rm.pixH, bleed: rm.bleed }
-              });
-            };
-            img.src = serverImg.dataUrl;
-          });
-        }).catch(function(serverErr) {
-          // Server render failed — fall back to browser-decoded image
-          console.warn('Server render failed for raster, using browser fallback:', serverErr);
-          var rm = item.rasterMeta;
-          var rasterResult = {
-            imgDataUrl: rm.imgDataUrl,
-            widthIn: rm.widthIn,
-            heightIn: rm.heightIn,
-            hasWhiteEdges: rm.hasWhiteEdges,
-            totalPages: 1,
-            trimBox: rm.bleed > 0 ? { widthIn: rm.trimW, heightIn: rm.trimH } : null,
-            spotColors: [],
-            rasterInfo: { dpi: rm.dpi, pixW: rm.pixW, pixH: rm.pixH, bleed: rm.bleed }
-          };
-          if (item.whitePlateFile) {
-            return loadWhitePlateFile(item.whitePlateFile, item.whitePlatePageNum).then(function(thumb) {
-              if (thumb) {
-                if (!thumb.spotName) thumb.spotName = item.whitePlateFile.name;
-                rasterResult.whitePlateThumb = thumb;
-              }
-              return rasterResult;
             });
-          }
-          return rasterResult;
-        });
+          }).catch(function(wrapErr) {
+            console.warn('TIFF /wrap failed, falling back to /render:', wrapErr);
+            // Fall through to the GS /render path below
+            return _getPageImageViaRender(item);
+          });
+        }
+
+        // ── JPEG and other rasters: GS /render path ──
+        return _getPageImageViaRender(item);
       } else {
         // ── Always use GS server for PDFs — proper color management ──
         // and consistent rendering of blends, gradients, and complex artwork

@@ -1,0 +1,875 @@
+<!DOCTYPE html>
+<!-- Copyright Scott Jehlik, DBA Mad Rtist Graphics -->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Raster Render Test</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f7; color: #1d1d1f; padding: 24px; }
+h1 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
+.subtitle { color: #86868b; font-size: 13px; margin-bottom: 20px; }
+.drop-zone {
+  border: 2px dashed #d2d2d7; border-radius: 14px; padding: 44px 24px;
+  text-align: center; cursor: pointer; background: #fafafa; transition: all 0.2s;
+  margin-bottom: 20px;
+}
+.drop-zone:hover, .drop-zone.dragover { border-color: #0071e3; background: #f0f7ff; }
+.drop-zone .icon { font-size: 40px; margin-bottom: 10px; }
+.drop-zone p { font-size: 15px; color: #6e6e73; }
+.drop-zone .sub { font-size: 12px; color: #aaa; margin-top: 4px; }
+
+.card {
+  background: #fff; border-radius: 14px; padding: 20px 24px;
+  margin-bottom: 16px; box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+}
+.card h2 {
+  font-size: 12px; font-weight: 600; color: #86868b;
+  text-transform: uppercase; letter-spacing: 0.5px;
+  margin-bottom: 12px; padding-bottom: 6px; border-bottom: 1px solid #f0f0f0;
+}
+
+.info-grid {
+  display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 8px 16px;
+  margin-bottom: 12px;
+}
+.info-item .label { font-size: 10px; font-weight: 600; color: #86868b; text-transform: uppercase; }
+.info-item .value { font-size: 15px; font-weight: 600; color: #1d1d1f; }
+.info-item .value.warn { color: #dc2626; }
+.info-item .value.ok { color: #16a34a; }
+.info-item .value.accent { color: #0071e3; }
+
+/* Render panels — stacked full width for big previews */
+.render-panel {
+  margin-bottom: 20px; padding-bottom: 16px;
+  border-bottom: 1px solid #f0f0f0;
+}
+.render-panel:last-child { border-bottom: none; margin-bottom: 0; }
+.render-panel-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 8px;
+}
+.render-panel-header h3 {
+  font-size: 14px; font-weight: 600; color: #1d1d1f;
+}
+.render-panel .render-status {
+  font-size: 12px; color: #86868b; margin-bottom: 6px; min-height: 16px;
+}
+.render-panel .render-frame {
+  background: #e8e8ed; border-radius: 10px; overflow: hidden;
+  min-height: 80px; display: flex; align-items: center; justify-content: center;
+  position: relative;
+}
+.render-panel .render-frame img, .render-panel .render-frame canvas {
+  max-width: 100%; display: block;
+}
+.render-panel .render-dims {
+  font-size: 11px; color: #86868b; margin-top: 4px;
+}
+
+.btn-download {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 16px; border: none; border-radius: 8px;
+  font-size: 13px; font-weight: 600; cursor: pointer;
+  background: #0071e3; color: #fff; transition: all 0.2s;
+  text-decoration: none;
+}
+.btn-download:hover { background: #0077ed; }
+.btn-download.secondary { background: #e8e8ed; color: #1d1d1f; }
+.btn-download.secondary:hover { background: #dcdce0; }
+
+.log-box {
+  background: #1d1d1f; color: #86e89f; border-radius: 10px; padding: 14px 16px;
+  font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px;
+  max-height: 300px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+}
+
+.spinner {
+  width: 32px; height: 32px; border: 3px solid #e8e8ed;
+  border-top-color: #0071e3; border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.hidden { display: none; }
+
+.cmyk-note {
+  background: #fffbeb; border: 1px solid #fde68a; border-radius: 10px;
+  padding: 12px 16px; margin-bottom: 16px; font-size: 13px; color: #92400e;
+}
+</style>
+</head>
+<body>
+
+<h1>🔬 Raster Render Test</h1>
+<p class="subtitle">Drop a JPEG/PNG/TIF — compare browser decode vs GS server render, check orientation & color. Download any version to compare.</p>
+
+<div class="drop-zone" id="drop-zone">
+  <div class="icon">📄</div>
+  <p>Click or drag & drop a raster file</p>
+  <div class="sub">JPG, PNG, TIF</div>
+</div>
+<input type="file" id="file-input" accept=".jpg,.jpeg,.png,.tif,.tiff" style="display:none;">
+
+<!-- File Info -->
+<div class="card hidden" id="info-card">
+  <h2>File Info</h2>
+  <div class="info-grid">
+    <div class="info-item">
+      <div class="label">Filename</div>
+      <div class="value" id="info-name">—</div>
+    </div>
+    <div class="info-item">
+      <div class="label">File Size</div>
+      <div class="value" id="info-size">—</div>
+    </div>
+    <div class="info-item">
+      <div class="label">Format</div>
+      <div class="value" id="info-format">—</div>
+    </div>
+    <div class="info-item">
+      <div class="label">Color Mode</div>
+      <div class="value" id="info-color">—</div>
+    </div>
+    <div class="info-item">
+      <div class="label">SOF Dimensions</div>
+      <div class="value" id="info-sof-dims">—</div>
+    </div>
+    <div class="info-item">
+      <div class="label">Megapixels</div>
+      <div class="value" id="info-mp">—</div>
+    </div>
+    <div class="info-item">
+      <div class="label">DPI (from metadata)</div>
+      <div class="value" id="info-dpi">—</div>
+    </div>
+    <div class="info-item">
+      <div class="label">Print Size @ DPI</div>
+      <div class="value" id="info-print-size">—</div>
+    </div>
+  </div>
+  <div class="info-grid">
+    <div class="info-item">
+      <div class="label">SOF Marker</div>
+      <div class="value" id="info-sof">—</div>
+    </div>
+    <div class="info-item">
+      <div class="label">Components</div>
+      <div class="value" id="info-components">—</div>
+    </div>
+    <div class="info-item">
+      <div class="label">EXIF Orientation</div>
+      <div class="value" id="info-orientation">—</div>
+    </div>
+    <div class="info-item">
+      <div class="label">ICC Profile</div>
+      <div class="value" id="info-icc">—</div>
+    </div>
+  </div>
+</div>
+
+<!-- Render Results -->
+<div class="card hidden" id="render-card">
+  <h2>Render Results</h2>
+  <div id="render-panels"></div>
+</div>
+
+<!-- Log -->
+<div class="card hidden" id="log-card">
+  <h2>Debug Log</h2>
+  <div class="log-box" id="log"></div>
+</div>
+
+<script>
+var GS_SERVER_URL = 'https://gs-thumbnail-server.fly.dev';
+var _currentFilename = 'download';
+var _lastIsCMYK = false;
+var _lastSofW = 0;
+var _lastSofH = 0;
+var _lastNumComponents = 0;
+
+var dropZone = document.getElementById('drop-zone');
+var fileInput = document.getElementById('file-input');
+var infoCard = document.getElementById('info-card');
+var renderCard = document.getElementById('render-card');
+var logCard = document.getElementById('log-card');
+var logBox = document.getElementById('log');
+var renderPanels = document.getElementById('render-panels');
+
+function log(msg) {
+  var ts = new Date().toLocaleTimeString();
+  logBox.textContent += '[' + ts + '] ' + msg + '\n';
+  logBox.scrollTop = logBox.scrollHeight;
+  console.log(msg);
+}
+
+// Drop zone
+dropZone.addEventListener('click', function() { fileInput.value = ''; fileInput.click(); });
+['dragenter','dragover'].forEach(function(e) {
+  dropZone.addEventListener(e, function(ev) { ev.preventDefault(); ev.stopPropagation(); dropZone.classList.add('dragover'); });
+});
+dropZone.addEventListener('dragleave', function(ev) { ev.preventDefault(); dropZone.classList.remove('dragover'); });
+dropZone.addEventListener('drop', function(ev) {
+  ev.preventDefault(); ev.stopPropagation(); dropZone.classList.remove('dragover');
+  if (ev.dataTransfer.files.length > 0) processFile(ev.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', function() {
+  if (fileInput.files.length > 0) processFile(fileInput.files[0]);
+});
+
+// Prevent default drag
+document.addEventListener('dragover', function(e) { e.preventDefault(); });
+document.addEventListener('drop', function(e) {
+  if (!e.target.closest('#drop-zone')) e.preventDefault();
+});
+
+// ── Download helper ──
+function downloadCanvas(canvas, label) {
+  var baseName = _currentFilename.replace(/\.[^.]+$/, '');
+  var safeName = baseName + '_' + label.replace(/[^a-zA-Z0-9]/g, '_') + '.jpg';
+  var dataUrl = canvas.toDataURL('image/jpeg', 0.95);
+  var a = document.createElement('a');
+  a.href = dataUrl;
+  a.download = safeName;
+  a.click();
+}
+
+function downloadDataUrl(dataUrl, label) {
+  var baseName = _currentFilename.replace(/\.[^.]+$/, '');
+  var safeName = baseName + '_' + label.replace(/[^a-zA-Z0-9]/g, '_') + '.jpg';
+  var a = document.createElement('a');
+  a.href = dataUrl;
+  a.download = safeName;
+  a.click();
+}
+
+// ── Build a minimal PDF wrapper around raw JPEG bytes (client-side) ──
+// Embeds the JPEG verbatim via DCTDecode — no decompression, no color conversion.
+// The resulting PDF should open in Acrobat with full CMYK fidelity.
+function buildPdfWrapper(jpegArrayBuffer, pixW, pixH, numComponents) {
+  var jpegBytes = new Uint8Array(jpegArrayBuffer);
+  var jpegLen = jpegBytes.length;
+  var cs = numComponents === 4 ? '/DeviceCMYK' : '/DeviceRGB';
+
+  // Adobe Photoshop CMYK JPEGs store inverted values (0=full ink, 255=no ink).
+  // Detect the Adobe APP14 marker to know if we need /Decode inversion.
+  var needsInvert = false;
+  if (numComponents === 4) {
+    // Walk JPEG markers to find APP14 (0xFFEE)
+    // Scan up to 1MB — large ICC profiles can push APP14 past 500KB
+    var jpos = 2; // skip SOI
+    while (jpos < Math.min(jpegLen, 1024 * 1024) - 10) {
+      if (jpegBytes[jpos] !== 0xFF) { jpos++; continue; }
+      while (jpos < jpegLen - 1 && jpegBytes[jpos + 1] === 0xFF) jpos++;
+      var jmk = jpegBytes[jpos + 1];
+      jpos += 2;
+      if (jmk === 0xD8 || jmk === 0xD9 || (jmk >= 0xD0 && jmk <= 0xD7)) continue;
+      if (jmk === 0xEE) { // Adobe APP14
+        needsInvert = true;
+        break;
+      }
+      if (jmk === 0xDA) break; // SOS = end of markers
+      if (jpos + 1 >= jpegLen) break;
+      var jsl = (jpegBytes[jpos] << 8) | jpegBytes[jpos + 1];
+      if (jsl < 2) break;
+      jpos += jsl;
+    }
+  }
+  // /Decode [1 0 1 0 1 0 1 0] uninverts Adobe-style CMYK
+  var decodeStr = needsInvert ? ' /Decode [1 0 1 0 1 0 1 0]' : '';
+
+  var header = '%PDF-1.3\n';
+  var obj1 = '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n';
+  var obj2 = '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n';
+  // Page size: cap at 4800 pts on longest side to keep output manageable
+  var maxPts = 4800;
+  var aspect = pixW / pixH;
+  var pgW, pgH;
+  if (pixW >= pixH) { pgW = Math.min(pixW, maxPts); pgH = Math.round(pgW / aspect); }
+  else { pgH = Math.min(pixH, maxPts); pgW = Math.round(pgH * aspect); }
+  var obj3 = '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ' + pgW + ' ' + pgH + '] /Contents 4 0 R /Resources << /XObject << /Im0 5 0 R >> >> >>\nendobj\n';
+  var contentStr = 'q ' + pgW + ' 0 0 ' + pgH + ' 0 0 cm /Im0 Do Q\n';
+  var obj4 = '4 0 obj\n<< /Length ' + contentStr.length + ' >>\nstream\n' + contentStr + 'endstream\nendobj\n';
+  var obj5Header = '5 0 obj\n<< /Type /XObject /Subtype /Image /Width ' + pixW + ' /Height ' + pixH + ' /ColorSpace ' + cs + ' /BitsPerComponent 8 /Filter /DCTDecode' + decodeStr + ' /Length ' + jpegLen + ' >>\nstream\n';
+  var obj5Footer = '\nendstream\nendobj\n';
+
+  // Encode text parts as bytes
+  var textParts = [header, obj1, obj2, obj3, obj4, obj5Header];
+  var encoder = new TextEncoder();
+  var encodedParts = textParts.map(function(s) { return encoder.encode(s); });
+
+  // Calculate offsets for xref
+  var offsets = [];
+  var pos = 0;
+  for (var i = 0; i < encodedParts.length; i++) {
+    if (i > 0) offsets.push(pos);
+    pos += encodedParts[i].length;
+  }
+  var afterStream = pos + jpegLen + encoder.encode(obj5Footer).length;
+
+  var xref = 'xref\n0 6\n';
+  xref += '0000000000 65535 f \n';
+  for (var i = 0; i < offsets.length; i++) {
+    xref += String(offsets[i]).padStart(10, '0') + ' 00000 n \n';
+  }
+  xref += 'trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n' + afterStream + '\n%%EOF\n';
+
+  var footerBytes = encoder.encode(obj5Footer + xref);
+
+  // Assemble into a single ArrayBuffer
+  var totalLen = pos + jpegLen + footerBytes.length;
+  var result = new Uint8Array(totalLen);
+  var offset = 0;
+  for (var i = 0; i < encodedParts.length; i++) {
+    result.set(encodedParts[i], offset);
+    offset += encodedParts[i].length;
+  }
+  result.set(jpegBytes, offset);
+  offset += jpegLen;
+  result.set(footerBytes, offset);
+
+  return result;
+}
+
+function downloadPdfWrapper(file, pixW, pixH, numComponents) {
+  file.arrayBuffer().then(function(buf) {
+    var pdfBytes = buildPdfWrapper(buf, pixW, pixH, numComponents);
+    var blob = new Blob([pdfBytes], { type: 'application/pdf' });
+    var url = URL.createObjectURL(blob);
+    var baseName = _currentFilename.replace(/\.[^.]+$/, '');
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = baseName + '_wrapped.pdf';
+    a.click();
+    setTimeout(function() { URL.revokeObjectURL(url); }, 5000);
+    log('PDF wrapper downloaded: ' + pdfBytes.length + ' bytes (' + (pdfBytes.length - file.size) + ' bytes overhead)');
+  });
+}
+
+// ── Create a render panel ──
+function addRenderPanel(title, icon, statusId) {
+  var panel = document.createElement('div');
+  panel.className = 'render-panel';
+  panel.innerHTML =
+    '<div class="render-panel-header">' +
+      '<h3>' + icon + ' ' + title + '</h3>' +
+      '<div id="' + statusId + '-actions"></div>' +
+    '</div>' +
+    '<div class="render-status" id="' + statusId + '-status">Waiting…</div>' +
+    '<div class="render-frame" id="' + statusId + '-frame"></div>' +
+    '<div class="render-dims" id="' + statusId + '-dims"></div>';
+  renderPanels.appendChild(panel);
+  return panel;
+}
+
+function setStatus(id, text) { document.getElementById(id + '-status').textContent = text; }
+function setDims(id, text) { document.getElementById(id + '-dims').textContent = text; }
+function getFrame(id) { return document.getElementById(id + '-frame'); }
+function getActions(id) { return document.getElementById(id + '-actions'); }
+
+function addDownloadBtn(actionsId, canvas, label) {
+  var btn = document.createElement('button');
+  btn.className = 'btn-download';
+  btn.textContent = '⬇ Download';
+  btn.onclick = function() { downloadCanvas(canvas, label); };
+  document.getElementById(actionsId + '-actions').appendChild(btn);
+}
+
+function addDownloadBtnFromUrl(actionsId, dataUrl, label) {
+  var btn = document.createElement('button');
+  btn.className = 'btn-download';
+  btn.textContent = '⬇ Download';
+  btn.onclick = function() { downloadDataUrl(dataUrl, label); };
+  document.getElementById(actionsId + '-actions').appendChild(btn);
+}
+
+function processFile(file) {
+  // Reset
+  logBox.textContent = '';
+  infoCard.classList.remove('hidden');
+  renderCard.classList.remove('hidden');
+  logCard.classList.remove('hidden');
+  renderPanels.innerHTML = '';
+  _currentFilename = file.name;
+
+  log('File: ' + file.name);
+  log('Size: ' + (file.size / 1024 / 1024).toFixed(2) + ' MB (' + file.size.toLocaleString() + ' bytes)');
+
+  // Read enough header to find SOF — large ICC profiles can push it past 700KB
+  var headerSize = Math.min(file.size, 2 * 1024 * 1024);
+  file.slice(0, headerSize).arrayBuffer().then(function(headerBuf) {
+    var uint8 = new Uint8Array(headerBuf);
+    analyzeHeader(uint8, file);
+
+    file._isCMYK = _lastIsCMYK;
+
+    // If CMYK, add a "Download Wrapped PDF" panel so user can verify the wrapper in Acrobat
+    if (_lastIsCMYK && _lastSofW > 0) {
+      addRenderPanel('PDF Wrapper (download to verify in Acrobat)', '📄', 'pdfwrap');
+      setStatus('pdfwrap', 'Raw JPEG bytes wrapped in a minimal PDF with /DeviceCMYK — no color conversion applied.');
+      var wrapFrame = getFrame('pdfwrap');
+      wrapFrame.innerHTML = '<div style="padding:20px;text-align:center;">' +
+        '<p style="font-size:13px;color:#666;margin-bottom:12px;">This builds the same PDF wrapper the server uses.<br>Open it in Acrobat to verify CMYK is preserved before GS renders it.</p>' +
+        '</div>';
+      var wrapBtn = document.createElement('button');
+      wrapBtn.className = 'btn-download';
+      wrapBtn.textContent = '⬇ Download Wrapped PDF';
+      wrapBtn.style.cssText = 'margin:0 auto;display:block;';
+      (function(f, sw, sh, nc) {
+        wrapBtn.onclick = function() { downloadPdfWrapper(f, sw, sh, nc); };
+      })(file, _lastSofW, _lastSofH, _lastNumComponents);
+      wrapFrame.querySelector('div').appendChild(wrapBtn);
+    }
+
+    // Browser decode panel
+    addRenderPanel('Browser Decode (raw)', '🖥', 'browser');
+    browserDecode(file);
+
+    // Server render panel
+    addRenderPanel('GS Server Render', '🌐', 'server');
+    serverRender(file);
+  });
+}
+
+// ══════════════════════════════════════
+// ── Header analysis ──
+// ══════════════════════════════════════
+function analyzeHeader(uint8, file) {
+  var ext = file.name.split('.').pop().toUpperCase();
+  if (ext === 'JPEG') ext = 'JPG';
+  if (ext === 'TIFF') ext = 'TIF';
+
+  document.getElementById('info-name').textContent = file.name;
+  document.getElementById('info-size').textContent = (file.size / 1024 / 1024).toFixed(1) + ' MB';
+  document.getElementById('info-format').textContent = ext;
+
+  // Walk JPEG marker structure properly
+  var sofW = 0, sofH = 0, sofMarker = '', numComponents = 0;
+  if (uint8[0] === 0xFF && uint8[1] === 0xD8) {
+    var pos = 2;
+    while (pos < uint8.length - 10) {
+      if (uint8[pos] !== 0xFF) { pos++; continue; }
+      while (pos < uint8.length - 1 && uint8[pos + 1] === 0xFF) pos++;
+      var mk = uint8[pos + 1];
+      pos += 2;
+      if (mk === 0xD8 || mk === 0xD9 || (mk >= 0xD0 && mk <= 0xD7)) continue;
+      if (mk >= 0xC0 && mk <= 0xC3) {
+        sofMarker = '0xFF' + mk.toString(16).toUpperCase().padStart(2, '0');
+        sofH = (uint8[pos + 3] << 8) | uint8[pos + 4];
+        sofW = (uint8[pos + 5] << 8) | uint8[pos + 6];
+        numComponents = uint8[pos + 7];
+        break;
+      }
+      if (pos + 1 >= uint8.length) break;
+      var segLen = (uint8[pos] << 8) | uint8[pos + 1];
+      if (segLen < 2) break;
+      pos += segLen;
+    }
+  }
+
+  var isCMYK = numComponents === 4;
+  _lastIsCMYK = isCMYK;
+  _lastSofW = sofW;
+  _lastSofH = sofH;
+  _lastNumComponents = numComponents;
+  var mp = (sofW * sofH / 1000000).toFixed(1);
+
+  document.getElementById('info-sof-dims').textContent = sofW > 0 ? sofW + ' × ' + sofH + ' px' : 'Not found';
+  document.getElementById('info-mp').textContent = sofW > 0 ? mp + ' MP' : '—';
+  document.getElementById('info-mp').className = 'value' + (sofW * sofH > 80000000 ? ' warn' : '');
+  document.getElementById('info-sof').textContent = sofMarker || 'Not found';
+  document.getElementById('info-components').textContent = numComponents > 0
+    ? numComponents + ' (' + (isCMYK ? 'CMYK' : numComponents === 3 ? 'RGB' : numComponents === 1 ? 'Grayscale' : 'Unknown') + ')'
+    : '—';
+  document.getElementById('info-color').textContent = isCMYK ? 'CMYK (4-comp)' : numComponents === 3 ? 'RGB' : numComponents === 1 ? 'Grayscale' : '—';
+  document.getElementById('info-color').className = 'value' + (isCMYK ? ' warn' : ' ok');
+
+  log('SOF: ' + sofMarker + ' — ' + sofW + '×' + sofH + ' — ' + numComponents + ' components (' + (isCMYK ? 'CMYK' : 'RGB') + ')');
+  log('Megapixels: ' + mp + ' MP' + (sofW * sofH > 80000000 ? ' ⚠️ HUGE' : ''));
+
+  var dpi = detectDpi(uint8);
+  document.getElementById('info-dpi').textContent = dpi > 0 ? dpi + ' DPI' : 'Not found';
+  if (dpi > 0 && sofW > 0) {
+    document.getElementById('info-print-size').textContent = (sofW / dpi).toFixed(2) + '" × ' + (sofH / dpi).toFixed(2) + '"';
+    log('DPI: ' + dpi + ' → ' + (sofW / dpi).toFixed(2) + '" × ' + (sofH / dpi).toFixed(2) + '"');
+  } else {
+    document.getElementById('info-print-size').textContent = '—';
+  }
+
+  var orientation = detectExifOrientation(uint8);
+  document.getElementById('info-orientation').textContent = orientation > 0
+    ? orientation + (orientation === 1 ? ' (normal)' : ' ⚠️ rotated!') : 'None';
+
+  var hasICC = detectICC(uint8);
+  document.getElementById('info-icc').textContent = hasICC ? 'Yes' : 'No';
+  document.getElementById('info-icc').className = 'value' + (hasICC ? ' accent' : '');
+}
+
+function detectDpi(uint8) {
+  for (var i = 0; i < Math.min(uint8.length, 1000) - 16; i++) {
+    if (uint8[i] === 0xFF && uint8[i+1] === 0xE0) {
+      if (uint8[i+4] === 0x4A && uint8[i+5] === 0x46 && uint8[i+6] === 0x49 && uint8[i+7] === 0x46) {
+        var units = uint8[i+9];
+        var xDens = (uint8[i+10] << 8) | uint8[i+11];
+        if (units === 1 && xDens > 0) return xDens;
+        if (units === 2 && xDens > 0) return Math.round(xDens * 2.54);
+      }
+      break;
+    }
+  }
+  for (var i = 0; i < Math.min(uint8.length, 65536) - 12; i++) {
+    if (uint8[i] === 0xFF && uint8[i+1] === 0xE1) {
+      var exifStart = i + 4;
+      if (uint8[exifStart] === 0x45 && uint8[exifStart+1] === 0x78 && uint8[exifStart+2] === 0x69 && uint8[exifStart+3] === 0x66) {
+        var tiffStart = exifStart + 6;
+        var isLE = uint8[tiffStart] === 0x49;
+        function read16(off) { return isLE ? (uint8[off] | (uint8[off+1] << 8)) : ((uint8[off] << 8) | uint8[off+1]); }
+        function read32(off) { return isLE ? (uint8[off] | (uint8[off+1] << 8) | (uint8[off+2] << 16) | (uint8[off+3] << 24)) : ((uint8[off] << 24) | (uint8[off+1] << 16) | (uint8[off+2] << 8) | uint8[off+3]); }
+        var ifdOff = tiffStart + read32(tiffStart + 4);
+        var numEntries = read16(ifdOff);
+        for (var e = 0; e < numEntries; e++) {
+          var entryOff = ifdOff + 2 + e * 12;
+          if (read16(entryOff) === 0x011A) {
+            var valOff = tiffStart + read32(entryOff + 8);
+            var num = read32(valOff), den = read32(valOff + 4);
+            if (den > 0) return Math.round(num / den);
+          }
+        }
+      }
+      break;
+    }
+  }
+  return 0;
+}
+
+function detectExifOrientation(uint8) {
+  for (var i = 0; i < Math.min(uint8.length, 65536) - 12; i++) {
+    if (uint8[i] === 0xFF && uint8[i+1] === 0xE1) {
+      var exifStart = i + 4;
+      if (uint8[exifStart] === 0x45 && uint8[exifStart+1] === 0x78) {
+        var tiffStart = exifStart + 6;
+        var isLE = uint8[tiffStart] === 0x49;
+        function rd16(off) { return isLE ? (uint8[off] | (uint8[off+1] << 8)) : ((uint8[off] << 8) | uint8[off+1]); }
+        function rd32(off) { return isLE ? (uint8[off] | (uint8[off+1] << 8) | (uint8[off+2] << 16) | (uint8[off+3] << 24)) : ((uint8[off] << 24) | (uint8[off+1] << 16) | (uint8[off+2] << 8) | uint8[off+3]); }
+        var ifdOff = tiffStart + rd32(tiffStart + 4);
+        var numE = rd16(ifdOff);
+        for (var e = 0; e < numE; e++) {
+          var eOff = ifdOff + 2 + e * 12;
+          if (rd16(eOff) === 0x0112) {
+            return isLE ? (uint8[eOff+8] | (uint8[eOff+9] << 8)) : ((uint8[eOff+8] << 8) | uint8[eOff+9]);
+          }
+        }
+      }
+      break;
+    }
+  }
+  return 0;
+}
+
+function detectICC(uint8) {
+  for (var i = 0; i < Math.min(uint8.length, 200000) - 14; i++) {
+    if (uint8[i] === 0xFF && uint8[i+1] === 0xE2) {
+      if (uint8[i+4] === 0x49 && uint8[i+5] === 0x43 && uint8[i+6] === 0x43) return true;
+    }
+  }
+  return false;
+}
+
+// ══════════════════════════════════════
+// ── Browser decode ──
+// ══════════════════════════════════════
+function browserDecode(file) {
+  var frame = getFrame('browser');
+  frame.innerHTML = '<div class="spinner"></div>';
+  var startTime = performance.now();
+
+  var url = URL.createObjectURL(file);
+  var img = new Image();
+
+  var timeout = setTimeout(function() {
+    log('⚠️ Browser decode: no onload after 15s');
+    setStatus('browser', '⚠️ Timeout — image may be too large');
+  }, 15000);
+
+  img.onload = function() {
+    clearTimeout(timeout);
+    var elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
+    var w = img.naturalWidth, h = img.naturalHeight;
+    log('✅ Browser decode: ' + w + '×' + h + ' in ' + elapsed + 's');
+    setStatus('browser', '✅ Decoded in ' + elapsed + 's');
+    setDims('browser', w + ' × ' + h + ' px — aspect ' + (w/h).toFixed(3));
+
+    var maxDisplay = 2400;
+    var scale = Math.min(1, maxDisplay / Math.max(w, h));
+    var dw = Math.round(w * scale), dh = Math.round(h * scale);
+
+    try {
+      createImageBitmap(img, { resizeWidth: dw, resizeHeight: dh, resizeQuality: 'high' }).then(function(bmp) {
+        var canvas = document.createElement('canvas');
+        canvas.width = dw; canvas.height = dh;
+        canvas.getContext('2d').drawImage(bmp, 0, 0);
+        bmp.close();
+        frame.innerHTML = '';
+        frame.appendChild(canvas);
+        addDownloadBtn('browser', canvas, 'browser_raw');
+        log('Browser: display canvas ' + dw + '×' + dh);
+
+        samplePixels('Browser raw', canvas.getContext('2d'), dw, dh);
+
+        if (file._isCMYK) {
+          showCmykCorrected(canvas, dw, dh, file);
+        }
+      }).catch(function(err) {
+        log('⚠️ createImageBitmap failed: ' + err.message);
+        fallbackDraw(img, w, h, dw, dh, frame, file);
+      });
+    } catch(e) {
+      fallbackDraw(img, w, h, dw, dh, frame, file);
+    }
+  };
+
+  img.onerror = function() {
+    clearTimeout(timeout);
+    log('❌ Browser decode FAILED');
+    setStatus('browser', '❌ Failed to decode');
+    frame.innerHTML = '<div style="color:#dc2626;padding:20px;">Browser cannot decode this image</div>';
+    URL.revokeObjectURL(url);
+  };
+
+  img.src = url;
+}
+
+function fallbackDraw(img, w, h, dw, dh, frame, file) {
+  var canvas = document.createElement('canvas');
+  canvas.width = dw; canvas.height = dh;
+  canvas.getContext('2d').drawImage(img, 0, 0, dw, dh);
+  frame.innerHTML = '';
+  frame.appendChild(canvas);
+  addDownloadBtn('browser', canvas, 'browser_raw');
+  if (file && file._isCMYK) {
+    showCmykCorrected(canvas, dw, dh, file);
+  }
+}
+
+// ══════════════════════════════════════
+// ── CMYK correction strategies ──
+// ══════════════════════════════════════
+function showCmykCorrected(sourceCanvas, w, h, file) {
+  log('CMYK detected — generating corrected versions…');
+  var ctx = sourceCanvas.getContext('2d');
+  var imgData = ctx.getImageData(0, 0, w, h);
+  var d = imgData.data;
+
+  // Check what the browser did with the alpha channel
+  // If alpha is all 255, the browser merged CMYK→RGB (badly).
+  // If alpha varies, the browser may have put K into the alpha channel.
+  var alphaSum = 0, alphaMin = 255, alphaMax = 0;
+  for (var si = 3; si < Math.min(d.length, 40000); si += 4) {
+    alphaSum += d[si];
+    if (d[si] < alphaMin) alphaMin = d[si];
+    if (d[si] > alphaMax) alphaMax = d[si];
+  }
+  var sampleCount = Math.min(d.length / 4, 10000);
+  var avgAlpha = alphaSum / sampleCount;
+  log('Alpha channel: min=' + alphaMin + ' max=' + alphaMax + ' avg=' + avgAlpha.toFixed(1));
+
+  var hasKInAlpha = (alphaMax - alphaMin) > 20;
+  log('K in alpha channel: ' + (hasKInAlpha ? 'YES — browser preserved CMYK channels' : 'NO — browser merged to RGB'));
+
+  var corrections = [];
+
+  // Strategy A: Simple inversion — for when browser decoded CMYK values as-is
+  var invData = ctx.createImageData(w, h);
+  var id = invData.data;
+  for (var i = 0; i < d.length; i += 4) {
+    id[i]   = 255 - d[i];
+    id[i+1] = 255 - d[i+1];
+    id[i+2] = 255 - d[i+2];
+    id[i+3] = 255;
+  }
+  var cA = makeCanvas(w, h, invData);
+  corrections.push({ canvas: cA, label: 'Fix A: Simple Inversion', desc: 'Inverts RGB channels (255 - value). Works when browser kept raw CMYK as RGB.' });
+
+  if (hasKInAlpha) {
+    // Strategy B: CMYK→RGB using alpha as K channel
+    var cmykData = ctx.createImageData(w, h);
+    var cd = cmykData.data;
+    for (var i = 0; i < d.length; i += 4) {
+      var c = d[i] / 255, m = d[i+1] / 255, y = d[i+2] / 255, k = d[i+3] / 255;
+      cd[i]   = Math.round(255 * (1 - c) * (1 - k));
+      cd[i+1] = Math.round(255 * (1 - m) * (1 - k));
+      cd[i+2] = Math.round(255 * (1 - y) * (1 - k));
+      cd[i+3] = 255;
+    }
+    var cB = makeCanvas(w, h, cmykData);
+    corrections.push({ canvas: cB, label: 'Fix B: CMYK→RGB (K in alpha)', desc: 'Treats RGBA as CMYK channels, applies subtractive formula.' });
+  }
+
+  // Strategy C: Inverted CMYK→RGB (Adobe-style)
+  // Adobe CMYK JPEGs store inverted values (0=full ink, 255=no ink)
+  var invCmykData = ctx.createImageData(w, h);
+  var icd = invCmykData.data;
+  for (var i = 0; i < d.length; i += 4) {
+    var k = hasKInAlpha ? (255 - d[i+3]) / 255 : 0;
+    var c = (255 - d[i]) / 255;
+    var m = (255 - d[i+1]) / 255;
+    var y = (255 - d[i+2]) / 255;
+    icd[i]   = Math.round(255 * (1 - c) * (1 - k));
+    icd[i+1] = Math.round(255 * (1 - m) * (1 - k));
+    icd[i+2] = Math.round(255 * (1 - y) * (1 - k));
+    icd[i+3] = 255;
+  }
+  var cC = makeCanvas(w, h, invCmykData);
+  corrections.push({ canvas: cC, label: 'Fix C: Inverted CMYK→RGB (Adobe)', desc: 'For Adobe-style inverted CMYK. Inverts first, then applies subtractive formula.' });
+
+  // Strategy D: Desaturate + warm shift (soft visual correction)
+  // Sometimes the browser's conversion is "close enough" but too vivid
+  var softData = ctx.createImageData(w, h);
+  var sd = softData.data;
+  for (var i = 0; i < d.length; i += 4) {
+    var r = d[i], g = d[i+1], b = d[i+2];
+    var lum = 0.299 * r + 0.587 * g + 0.114 * b;
+    // Pull 15% toward luminance (desaturate)
+    sd[i]   = Math.min(255, Math.round(lum + 0.85 * (r - lum)));
+    sd[i+1] = Math.min(255, Math.round(lum + 0.85 * (g - lum)));
+    sd[i+2] = Math.min(255, Math.round(lum + 0.85 * (b - lum)));
+    sd[i+3] = 255;
+  }
+  var cD = makeCanvas(w, h, softData);
+  corrections.push({ canvas: cD, label: 'Fix D: CMYK Gamut Sim', desc: 'Desaturates to simulate CMYK gamut loss (what ProofmakerPro was doing to ALL images).' });
+
+  // Render each correction as its own panel
+  corrections.forEach(function(corr, idx) {
+    var panelId = 'fix-' + idx;
+    addRenderPanel(corr.label, '🎨', panelId);
+    setStatus(panelId, corr.desc);
+    var frame = getFrame(panelId);
+    frame.innerHTML = '';
+    corr.canvas.style.cssText = 'max-width:100%;display:block;';
+    frame.appendChild(corr.canvas);
+    addDownloadBtn(panelId, corr.canvas, corr.label);
+    samplePixels(corr.label, corr.canvas.getContext('2d'), w, h);
+  });
+
+  log('CMYK corrections done — ' + corrections.length + ' strategies rendered');
+}
+
+function makeCanvas(w, h, imageData) {
+  var c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.getContext('2d').putImageData(imageData, 0, 0);
+  return c;
+}
+
+function samplePixels(label, ctx, w, h) {
+  var points = [
+    { name: 'center', x: Math.floor(w/2), y: Math.floor(h/2) },
+    { name: 'top-left', x: Math.floor(w * 0.1), y: Math.floor(h * 0.1) },
+    { name: 'top-right', x: Math.floor(w * 0.9), y: Math.floor(h * 0.1) },
+    { name: 'bottom-left', x: Math.floor(w * 0.1), y: Math.floor(h * 0.9) },
+    { name: 'mid-left', x: Math.floor(w * 0.25), y: Math.floor(h * 0.5) },
+  ];
+  var samples = [];
+  points.forEach(function(p) {
+    var d = ctx.getImageData(p.x, p.y, 1, 1).data;
+    samples.push(p.name + ': rgb(' + d[0] + ',' + d[1] + ',' + d[2] + ')');
+  });
+  log(label + ' pixels: ' + samples.join(' | '));
+}
+
+// ══════════════════════════════════════
+// ── Server render ──
+// ══════════════════════════════════════
+function serverRender(file) {
+  var frame = getFrame('server');
+  frame.innerHTML = '<div class="spinner"></div>';
+  var startTime = performance.now();
+
+  var url = GS_SERVER_URL + '/render?dpi=150&quality=95&pages=1';
+  var formData = new FormData();
+  formData.append('file', file);
+
+  log('Server: uploading to ' + GS_SERVER_URL + '…');
+
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', url);
+  xhr.timeout = 300000; // 5 minutes for huge files
+
+  xhr.upload.onprogress = function(e) {
+    if (e.lengthComputable) {
+      var pct = Math.round(e.loaded / e.total * 100);
+      setStatus('server', pct < 100 ? 'Uploading… ' + pct + '%' : 'Rendering on server…');
+      if (pct === 100) log('Server: upload complete, waiting for render…');
+    }
+  };
+
+  xhr.onload = function() {
+    var elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
+    if (xhr.status !== 200) {
+      log('❌ Server error ' + xhr.status + ': ' + xhr.responseText.substring(0, 300));
+      setStatus('server', '❌ Server error ' + xhr.status);
+      frame.innerHTML = '<div style="color:#dc2626;font-size:13px;padding:20px;word-break:break-word;">' +
+        'Server error: ' + xhr.responseText.substring(0, 300).replace(/</g,'&lt;') + '</div>';
+      return;
+    }
+    try {
+      var data = JSON.parse(xhr.responseText);
+      if (!data.pages || data.pages.length === 0) {
+        log('❌ Server returned no pages');
+        setStatus('server', '❌ No pages returned');
+        frame.innerHTML = '<div style="color:#dc2626;padding:20px;">Empty result</div>';
+        return;
+      }
+      var page = data.pages[0];
+      log('✅ Server render: ' + elapsed + 's, engine: ' + (data.engine || '?') + ', dataUrl: ' + (page.dataUrl ? page.dataUrl.length : 0) + ' chars');
+      setStatus('server', '✅ Rendered in ' + elapsed + 's (' + (data.engine || 'unknown') + ')');
+
+      var img = new Image();
+      img.onload = function() {
+        var w = img.naturalWidth, h = img.naturalHeight;
+        setDims('server', w + ' × ' + h + ' px — aspect ' + (w/h).toFixed(3));
+        frame.innerHTML = '';
+        img.style.maxWidth = '100%';
+        frame.appendChild(img);
+        addDownloadBtnFromUrl('server', page.dataUrl, 'server_render');
+
+        var canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        canvas.getContext('2d').drawImage(img, 0, 0);
+        samplePixels('Server', canvas.getContext('2d'), w, h);
+      };
+      img.onerror = function() {
+        log('❌ Could not decode server dataUrl — length: ' + (page.dataUrl ? page.dataUrl.length : 0));
+        log('   dataUrl prefix: ' + (page.dataUrl ? page.dataUrl.substring(0, 80) : 'null'));
+        setStatus('server', '❌ Image decode failed');
+        // Still offer download of the raw dataUrl so user can inspect
+        if (page.dataUrl && page.dataUrl.length > 0) {
+          addDownloadBtnFromUrl('server', page.dataUrl, 'server_render');
+          log('   Download button added — try downloading to inspect the file');
+        }
+      };
+      img.src = page.dataUrl;
+    } catch(e) {
+      log('❌ Parse error: ' + e.message);
+      setStatus('server', '❌ Parse error');
+    }
+  };
+
+  xhr.onerror = function() {
+    log('❌ Network error');
+    setStatus('server', '❌ Network error');
+    frame.innerHTML = '<div style="color:#dc2626;padding:20px;">Server unreachable</div>';
+  };
+
+  xhr.ontimeout = function() {
+    log('❌ Timeout (120s)');
+    setStatus('server', '❌ Timeout');
+    frame.innerHTML = '<div style="color:#dc2626;padding:20px;">Request timed out</div>';
+  };
+
+  xhr.send(formData);
+}
+</script>
+</body>
+</html>
