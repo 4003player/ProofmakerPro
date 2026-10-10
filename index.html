@@ -3785,7 +3785,7 @@ function renderPdfPageToImage(file, pageNum) {
         var targetScale = dpi / 72;
         // Ensure at least 1800px on longest side for proof quality
         // (critical for scaled-down vector files that are physically small)
-        var minProofPx = 1800;
+        var minProofPx = 2400;
         var currentLongPx = Math.max(vp.width, vp.height) * targetScale;
         if (currentLongPx < minProofPx) {
           targetScale = minProofPx / Math.max(vp.width, vp.height);
@@ -5069,24 +5069,31 @@ window.generateProof = function() {
         // ── Always use GS server for PDFs — proper color management ──
         // and consistent rendering of blends, gradients, and complex artwork
         {
-          return queueServerRender(item.file, 150, 95, String(item.pageNum)).then(function(serverData) {
+          // For small PDFs, request higher DPI so the proof has enough pixels.
+          // Target: at least 2400px on the longest side for crisp proof quality.
+          // Large PDFs stay at 150 DPI (already plenty of pixels).
+          return item.file.arrayBuffer().then(function(buf) {
+            var rawBytes = new Uint8Array(buf);
+            var allTrimBoxes = findTrimBox(rawBytes);
+            var spotColors = findSpotColors(rawBytes);
+
+            var bufCopy = buf.slice ? buf.slice(0) : new Uint8Array(buf).buffer;
+            return pdfjsLib.getDocument({ data: bufCopy }).promise.then(function(pdf) {
+              return pdf.getPage(item.pageNum || 1).then(function(page) {
+                var vp = page.getViewport({ scale: 1.0 });
+                var widthIn = vp.width / 72;
+                var heightIn = vp.height / 72;
+                var longestIn = Math.max(widthIn, heightIn);
+                var minProofPx = 2400;
+                var renderDpi = Math.max(150, Math.ceil(minProofPx / longestIn));
+                // Cap at 600 DPI — beyond that is diminishing returns
+                renderDpi = Math.min(renderDpi, 600);
+
+          return queueServerRender(item.file, renderDpi, 95, String(item.pageNum)).then(function(serverData) {
             if (!serverData.pages || serverData.pages.length === 0) {
               throw new Error('Server returned no pages');
             }
             var serverImg = serverData.pages[0];
-            // Still need metadata from raw bytes (trim box, spots, die lines)
-            return item.file.arrayBuffer().then(function(buf) {
-              var rawBytes = new Uint8Array(buf);
-              var allTrimBoxes = findTrimBox(rawBytes);
-              var spotColors = findSpotColors(rawBytes);
-
-              // Open with PDF.js for page dimensions + die line detection
-              var bufCopy = buf.slice ? buf.slice(0) : new Uint8Array(buf).buffer;
-              return pdfjsLib.getDocument({ data: bufCopy }).promise.then(function(pdf) {
-                return pdf.getPage(item.pageNum || 1).then(function(page) {
-                  var vp = page.getViewport({ scale: 1.0 });
-                  var widthIn = vp.width / 72;
-                  var heightIn = vp.height / 72;
 
                   // Pick best TrimBox for this page
                   var trimBox = null;
